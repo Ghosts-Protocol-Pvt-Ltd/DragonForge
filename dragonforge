@@ -399,7 +399,7 @@ cmd_status() {
 
     # Hook installed?
     header "Installation"
-    if [ -x /etc/libvirt/hooks/qemu ]; then
+    if sudo test -x /etc/libvirt/hooks/qemu 2>/dev/null; then
         success "Hook installed at /etc/libvirt/hooks/qemu"
     else
         warn "Hook not installed"
