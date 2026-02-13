@@ -26,6 +26,10 @@ GPU_DEVICE_ID="28a0"           # Your GPU's device ID
 GPU_AUDIO_VENDOR_ID="10de"
 GPU_AUDIO_DEVICE_ID="22be"     # Your GPU audio's device ID
 
+# GPU driver for host rebind after VM shutdown
+# nvidia, nouveau, amdgpu, radeon — auto-detected by 'dragonforge detect'
+GPU_DRIVER="nvidia"
+
 # ── ISO Paths ───────────────────────────────────────────────────────────────
 
 WIN_ISO_PATH="/path/to/Win11.iso"

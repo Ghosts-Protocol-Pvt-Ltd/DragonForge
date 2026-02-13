@@ -20,7 +20,7 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
-VERSION="1.1.0"
+VERSION="2.0.0"
 
 # ── Colors ──────────────────────────────────────────────────────────────────
 
@@ -48,6 +48,118 @@ warn()    { echo -e "  ${YELLOW}⚠${NC} $1"; }
 error()   { echo -e "  ${RED}✗${NC} $1"; }
 header()  { echo -e "\n  ${BOLD}${CYAN}── $1 ──${NC}\n"; }
 
+# ── Anti-Detection Helpers ──────────────────────────────────────────────────
+
+# Generate random alphanumeric string
+generate_random_string() {
+    local length="${1:-8}"
+    head -c 100 /dev/urandom | tr -dc 'A-Z0-9' | head -c "$length"
+}
+
+# Generate realistic MAC address using real hardware vendor OUIs
+# Avoids 52:54:00 (QEMU/KVM), 00:16:3E (Xen), 00:0C:29 (VMware)
+generate_mac() {
+    # Real-world OUI prefixes: Intel, Realtek, Intel
+    local -a oui_list=("00:1B:21" "3C:22:FB" "80:EE:73" "A4:83:E7" "F8:75:A4" "00:E0:4C" "D8:BB:C1")
+    local idx=$(( $(od -An -tu4 -N4 /dev/urandom | tr -d ' ') % ${#oui_list[@]} ))
+    local oui="${oui_list[$idx]}"
+    local b4=$(( $(od -An -tu1 -N1 /dev/urandom | tr -d ' ') ))
+    local b5=$(( $(od -An -tu1 -N1 /dev/urandom | tr -d ' ') ))
+    local b6=$(( $(od -An -tu1 -N1 /dev/urandom | tr -d ' ') ))
+    printf '%s:%02X:%02X:%02X' "$oui" "$b4" "$b5" "$b6"
+}
+
+# Generate disk serial matching Samsung NVMe patterns
+generate_disk_serial() {
+    printf 'S%s' "$(generate_random_string 11)"
+}
+
+# Generate HyperV vendor ID — random 12 chars, avoids all known hypervisor signatures
+generate_vendor_id() {
+    local id
+    while true; do
+        id=$(head -c 100 /dev/urandom | tr -dc 'A-Za-z0-9' | head -c 12)
+        local id_lower
+        id_lower=$(echo "$id" | tr '[:upper:]' '[:lower:]')
+        case "$id_lower" in
+            *kvmkvm*|*microsoft*|*vmware*|*xenvmm*|*acrn*|*genuineintel*|*authenticamd*) continue ;;
+            *) break ;;
+        esac
+    done
+    echo "$id"
+}
+
+# Detect GPU driver type for a PCI device
+detect_gpu_driver() {
+    local gpu_bdf="$1"
+    local vendor_id
+    vendor_id=$(cat "/sys/bus/pci/devices/$gpu_bdf/vendor" 2>/dev/null | sed 's/^0x//' | tr '[:upper:]' '[:lower:]')
+
+    case "$vendor_id" in
+        10de)
+            # NVIDIA — prefer nvidia proprietary, fallback nouveau
+            if [ -d "/sys/bus/pci/drivers/nvidia" ]; then
+                echo "nvidia"
+            elif [ -d "/sys/bus/pci/drivers/nouveau" ]; then
+                echo "nouveau"
+            else
+                echo "nvidia"  # assume nvidia will be installed
+            fi
+            ;;
+        1002)
+            # AMD — prefer amdgpu, fallback radeon
+            if [ -d "/sys/bus/pci/drivers/amdgpu" ]; then
+                echo "amdgpu"
+            elif [ -d "/sys/bus/pci/drivers/radeon" ]; then
+                echo "radeon"
+            else
+                echo "amdgpu"  # assume amdgpu will be available
+            fi
+            ;;
+        *)
+            echo "unknown"
+            ;;
+    esac
+}
+
+# Classify GPU as integrated or discrete
+classify_gpu() {
+    local gpu_bdf="$1"
+    local vendor_id device_id
+    vendor_id=$(cat "/sys/bus/pci/devices/$gpu_bdf/vendor" 2>/dev/null | sed 's/^0x//' | tr '[:upper:]' '[:lower:]')
+    device_id=$(cat "/sys/bus/pci/devices/$gpu_bdf/device" 2>/dev/null | sed 's/^0x//' | tr '[:upper:]' '[:lower:]')
+    local desc
+    desc=$(lspci -s "${gpu_bdf#0000:}" 2>/dev/null || echo "")
+
+    # Intel integrated GPUs (UHD, Iris, etc.)
+    if [ "$vendor_id" = "8086" ]; then
+        echo "integrated"
+        return
+    fi
+
+    # AMD APU integrated GPUs (Vega, Raphael, Phoenix, etc.)
+    if [ "$vendor_id" = "1002" ]; then
+        if echo "$desc" | grep -qiE "Raphael|Phoenix|Rembrandt|Barcelo|Cezanne|Renoir|Picasso|Raven|Vega.*\bGfx\b"; then
+            echo "integrated"
+            return
+        fi
+        # If on bus 00 or in same IOMMU group as root complex, likely integrated
+        local bus
+        bus=$(echo "$gpu_bdf" | cut -d: -f2)
+        if [ "$bus" = "00" ] || [[ "$bus" =~ ^0[0-5]$ ]]; then
+            # Could be integrated if the description doesn't match discrete patterns
+            if ! echo "$desc" | grep -qiE "Radeon RX|Navi|RDNA|Polaris|Vega 56|Vega 64"; then
+                echo "integrated"
+                return
+            fi
+        fi
+    fi
+
+    # NVIDIA is always discrete (no NVIDIA integrated GPUs on x86)
+    # AMD with RX/Navi/discrete identifiers
+    echo "discrete"
+}
+
 # ── Auto-generate Config ───────────────────────────────────────────────────
 
 auto_generate_config() {
@@ -61,34 +173,55 @@ auto_generate_config() {
     header "Auto-generating Config"
     info "No config found — detecting hardware..."
 
-    # Find first discrete NVIDIA/AMD GPU (VGA/3D controller)
-    local gpu_bdf="" gpu_vendor="" gpu_device=""
+    # ── Universal GPU Detection ─────────────────────────────────────────────
+    # Scan ALL GPUs, classify as integrated vs discrete, pick discrete for passthrough
+    local gpu_bdf="" gpu_vendor="" gpu_device="" gpu_driver=""
+    local igpu_bdf="" igpu_desc=""
+
     while IFS= read -r line; do
         local bdf desc
         bdf=$(echo "$line" | awk '{print $1}')
         desc=$(echo "$line" | cut -d' ' -f2-)
 
-        if echo "$desc" | grep -qiE "nvidia|radeon|amd.*navi|amd.*vega"; then
-            if echo "$desc" | grep -qiE "VGA|3D|Display"; then
-                gpu_bdf="$bdf"
-                # Normalize to full domain format
-                if [[ ! "$gpu_bdf" =~ ^[0-9a-fA-F]{4}: ]]; then
-                    gpu_bdf="0000:$gpu_bdf"
-                fi
-                gpu_vendor=$(cat "/sys/bus/pci/devices/$gpu_bdf/vendor" 2>/dev/null | sed 's/^0x//')
-                gpu_device=$(cat "/sys/bus/pci/devices/$gpu_bdf/device" 2>/dev/null | sed 's/^0x//')
-                break
-            fi
+        # Normalize to full domain format
+        if [[ ! "$bdf" =~ ^[0-9a-fA-F]{4}: ]]; then
+            bdf="0000:$bdf"
+        fi
+
+        # Skip if sysfs doesn't have this device
+        [ -d "/sys/bus/pci/devices/$bdf" ] || continue
+
+        local classification
+        classification=$(classify_gpu "$bdf")
+
+        if [ "$classification" = "discrete" ] && [ -z "$gpu_bdf" ]; then
+            gpu_bdf="$bdf"
+            gpu_vendor=$(cat "/sys/bus/pci/devices/$bdf/vendor" 2>/dev/null | sed 's/^0x//')
+            gpu_device=$(cat "/sys/bus/pci/devices/$bdf/device" 2>/dev/null | sed 's/^0x//')
+            gpu_driver=$(detect_gpu_driver "$bdf")
+            success "Discrete GPU: $bdf [$gpu_vendor:$gpu_device] ($desc)"
+            info "  Driver: $gpu_driver"
+        elif [ "$classification" = "integrated" ] && [ -z "$igpu_bdf" ]; then
+            igpu_bdf="$bdf"
+            igpu_desc="$desc"
+            info "Integrated GPU: $bdf ($desc) — will stay with host"
         fi
     done < <(lspci -Dnn 2>/dev/null | grep -iE "VGA|3D|Display" || true)
 
     if [ -z "$gpu_bdf" ]; then
-        error "No discrete NVIDIA/AMD GPU found"
-        info "Create config/dragonforge.conf manually from the example"
+        error "No discrete GPU found for passthrough"
+        if [ -n "$igpu_bdf" ]; then
+            info "Only found integrated GPU at $igpu_bdf"
+        fi
+        info "DragonForge requires a system with 2 GPUs (integrated + discrete)"
+        info "Create config/dragonforge.conf manually if detection is wrong"
         return 1
     fi
 
-    success "Found GPU: $gpu_bdf [$gpu_vendor:$gpu_device]"
+    if [ -z "$igpu_bdf" ]; then
+        warn "No integrated GPU detected — host will lose display during passthrough"
+        info "Consider using a second monitor or SSH access"
+    fi
 
     # Find matching audio device (same bus, function .1)
     local bus_prefix="${gpu_bdf%.*}"
@@ -165,6 +298,10 @@ GPU_VENDOR_ID="$gpu_vendor"
 GPU_DEVICE_ID="$gpu_device"
 GPU_AUDIO_VENDOR_ID="${audio_vendor:-$gpu_vendor}"
 GPU_AUDIO_DEVICE_ID="${audio_device:-EDIT_ME}"
+
+# GPU driver for host rebind after VM shutdown (auto-detected)
+# nvidia, nouveau, amdgpu, radeon
+GPU_DRIVER="$gpu_driver"
 
 # ── ISO Paths ───────────────────────────────────────────────────────────────
 
@@ -300,21 +437,31 @@ cmd_detect() {
         bdf=$(echo "$line" | awk '{print $1}')
         desc=$(echo "$line" | cut -d' ' -f2-)
 
-        if echo "$desc" | grep -qiE "nvidia|radeon|amd.*navi|amd.*vega"; then
-            # bdf may include domain (e.g. 0000:01:00.0) or not (01:00.0)
-            # sysfs always uses the full domain:bus:slot.function format
-            local sysfs_bdf="$bdf"
-            if [[ ! "$bdf" =~ ^[0-9a-fA-F]{4}: ]]; then
-                sysfs_bdf="0000:$bdf"
-            fi
+        # Normalize to full domain format
+        local sysfs_bdf="$bdf"
+        if [[ ! "$bdf" =~ ^[0-9a-fA-F]{4}: ]]; then
+            sysfs_bdf="0000:$bdf"
+        fi
 
-            local vendor_id device_id
-            vendor_id=$(cat "/sys/bus/pci/devices/$sysfs_bdf/vendor" 2>/dev/null | sed 's/^0x//')
-            device_id=$(cat "/sys/bus/pci/devices/$sysfs_bdf/device" 2>/dev/null | sed 's/^0x//')
+        local vendor_id device_id
+        vendor_id=$(cat "/sys/bus/pci/devices/$sysfs_bdf/vendor" 2>/dev/null | sed 's/^0x//')
+        device_id=$(cat "/sys/bus/pci/devices/$sysfs_bdf/device" 2>/dev/null | sed 's/^0x//')
 
-            echo -e "  ${GREEN}►${NC} ${BOLD}$bdf${NC}"
-            echo -e "    $desc"
-            echo -e "    ${DIM}Vendor:Device = $vendor_id:$device_id${NC}"
+        # Classify GPU
+        local gpu_class gpu_drv
+        gpu_class=$(classify_gpu "$sysfs_bdf")
+        gpu_drv=$(detect_gpu_driver "$sysfs_bdf")
+
+        local class_label
+        if [ "$gpu_class" = "integrated" ]; then
+            class_label="${BLUE}[integrated — host display]${NC}"
+        else
+            class_label="${GREEN}[discrete — passthrough candidate]${NC}"
+        fi
+
+        echo -e "  ${GREEN}►${NC} ${BOLD}$bdf${NC} $class_label"
+        echo -e "    $desc"
+        echo -e "    ${DIM}Vendor:Device = $vendor_id:$device_id  |  Driver: $gpu_drv${NC}"
 
             # IOMMU group
             local iommu_group
@@ -328,15 +475,20 @@ cmd_detect() {
                 echo -e "    ${DIM}Group members: $group_members${NC}"
             fi
 
-            # Current driver
-            local driver
-            driver=$(basename "$(readlink "/sys/bus/pci/devices/$sysfs_bdf/driver" 2>/dev/null)" 2>/dev/null)
-            echo -e "    ${DIM}Driver: ${driver:-none}${NC}"
-
             echo ""
             gpu_found=1
+    done < <(lspci -Dnn 2>/dev/null | grep -iE "VGA|3D|Display" || true)
+
+    # Also show audio devices that accompany GPUs
+    echo ""
+    while IFS= read -r line; do
+        local bdf desc
+        bdf=$(echo "$line" | awk '{print $1}')
+        desc=$(echo "$line" | cut -d' ' -f2-)
+        if echo "$desc" | grep -qiE "nvidia|radeon|amd.*audio"; then
+            echo -e "  ${DIM}  🔊 $bdf — $desc${NC}"
         fi
-    done < <(lspci -Dnn 2>/dev/null | grep -iE "VGA|3D|Display|Audio" || true)
+    done < <(lspci -Dnn 2>/dev/null | grep -i "Audio" || true)
 
     if [ "$gpu_found" -eq 0 ]; then
         warn "No discrete GPU found"
@@ -455,6 +607,7 @@ cmd_setup() {
 DRAGONFORGE_VM_NAME=$VM_NAME
 DRAGONFORGE_GPU_PCI=$GPU_PCI
 DRAGONFORGE_GPU_AUDIO=$GPU_AUDIO
+DRAGONFORGE_GPU_DRIVER=${GPU_DRIVER:-nvidia}
 ENVEOF
     success "Hook environment configured"
 
@@ -535,7 +688,7 @@ EOF
 
 cmd_vm_create() {
     print_banner
-    header "Creating VM"
+    header "Creating VM (Stealth Mode)"
 
     # Load config (auto-generates if missing)
     load_config
@@ -556,8 +709,8 @@ cmd_vm_create() {
     fi
 
     if [ -z "$virtio_iso" ] || [ ! -f "$virtio_iso" ]; then
-        warn "VirtIO ISO not found. Download from:"
-        info "https://fedorapeople.org/groups/virt/virtio-win/direct-downloads/stable-virtio/virtio-win.iso"
+        warn "VirtIO ISO not found — not needed for stealth mode (using SATA)"
+        virtio_iso=""
     fi
 
     # Create disk
@@ -581,31 +734,38 @@ cmd_vm_create() {
 
     # Find OVMF firmware — CODE and VARS must be the same size variant.
     # Windows 11 requires Secure Boot with Microsoft keys pre-enrolled.
-    # Prefer 4M SecureBoot (modern Fedora 38+), fall back to 2M, then non-SecureBoot.
-    local ovmf_code="" ovmf_src=""
-    local ovmf_vars="/var/lib/libvirt/images/${vm_name}_VARS.fd"
+    # 4M variants include TPM2 (Tcg2Dxe) drivers — REQUIRED for TPM support.
+    # 2M variants do NOT include TPM2 drivers and Windows will say "TPM 2.0 not found".
+    local ovmf_code="" ovmf_src="" ovmf_format="raw"
+    local ovmf_vars=""
     local -a firmware_pairs=(
-        # Fedora 4M SecureBoot (preferred for Win11)
-        "/usr/share/edk2/ovmf/OVMF_CODE_4M.secboot.fd:/usr/share/edk2/ovmf/OVMF_VARS_4M.secboot.fd"
-        # Fedora 2M SecureBoot
-        "/usr/share/edk2/ovmf/OVMF_CODE.secboot.fd:/usr/share/edk2/ovmf/OVMF_VARS.secboot.fd"
+        # Fedora 4M SecureBoot qcow2 (preferred — includes TPM2 drivers)
+        "/usr/share/edk2/ovmf/OVMF_CODE_4M.secboot.qcow2:/usr/share/edk2/ovmf/OVMF_VARS_4M.secboot.qcow2:qcow2"
+        # Fedora 4M SecureBoot raw
+        "/usr/share/edk2/ovmf/OVMF_CODE_4M.secboot.fd:/usr/share/edk2/ovmf/OVMF_VARS_4M.secboot.fd:raw"
+        # Fedora 2M SecureBoot (NO TPM2 drivers — avoid if possible)
+        "/usr/share/edk2/ovmf/OVMF_CODE.secboot.fd:/usr/share/edk2/ovmf/OVMF_VARS.secboot.fd:raw"
         # Ubuntu/Debian 4M SecureBoot
-        "/usr/share/OVMF/OVMF_CODE_4M.secboot.fd:/usr/share/OVMF/OVMF_VARS_4M.secboot.fd"
-        "/usr/share/OVMF/OVMF_CODE_4M.ms.fd:/usr/share/OVMF/OVMF_VARS_4M.ms.fd"
+        "/usr/share/OVMF/OVMF_CODE_4M.secboot.fd:/usr/share/OVMF/OVMF_VARS_4M.secboot.fd:raw"
+        "/usr/share/OVMF/OVMF_CODE_4M.ms.fd:/usr/share/OVMF/OVMF_VARS_4M.ms.fd:raw"
         # Ubuntu/Debian 2M SecureBoot
-        "/usr/share/OVMF/OVMF_CODE.secboot.fd:/usr/share/OVMF/OVMF_VARS.secboot.fd"
-        "/usr/share/OVMF/OVMF_CODE.ms.fd:/usr/share/OVMF/OVMF_VARS.ms.fd"
+        "/usr/share/OVMF/OVMF_CODE.secboot.fd:/usr/share/OVMF/OVMF_VARS.secboot.fd:raw"
+        "/usr/share/OVMF/OVMF_CODE.ms.fd:/usr/share/OVMF/OVMF_VARS.ms.fd:raw"
         # Fallback non-SecureBoot (Windows 11 will likely reject this)
-        "/usr/share/edk2/ovmf/OVMF_CODE_4M.fd:/usr/share/edk2/ovmf/OVMF_VARS_4M.fd"
-        "/usr/share/edk2/ovmf/OVMF_CODE.fd:/usr/share/edk2/ovmf/OVMF_VARS.fd"
-        "/usr/share/OVMF/OVMF_CODE.fd:/usr/share/OVMF/OVMF_VARS.fd"
+        "/usr/share/edk2/ovmf/OVMF_CODE_4M.fd:/usr/share/edk2/ovmf/OVMF_VARS_4M.fd:raw"
+        "/usr/share/edk2/ovmf/OVMF_CODE_4M.qcow2:/usr/share/edk2/ovmf/OVMF_VARS_4M.qcow2:qcow2"
+        "/usr/share/edk2/ovmf/OVMF_CODE.fd:/usr/share/edk2/ovmf/OVMF_VARS.fd:raw"
+        "/usr/share/OVMF/OVMF_CODE.fd:/usr/share/OVMF/OVMF_VARS.fd:raw"
     )
     for pair in "${firmware_pairs[@]}"; do
-        local code="${pair%%:*}"
-        local vars="${pair##*:}"
+        local code vars fmt
+        code=$(echo "$pair" | cut -d: -f1-2)  # handle paths with colons
+        # Actually split on the known delimiter pattern
+        IFS=: read -r code vars fmt <<< "$pair"
         if [ -f "$code" ] && [ -f "$vars" ]; then
             ovmf_code="$code"
             ovmf_src="$vars"
+            ovmf_format="${fmt:-raw}"
             break
         fi
     done
@@ -618,7 +778,15 @@ cmd_vm_create() {
         exit 1
     fi
 
-    success "OVMF CODE: $ovmf_code"
+    success "OVMF CODE: $ovmf_code (format: $ovmf_format)"
+
+    # Set VARS destination path based on format
+    if [ "$ovmf_format" = "qcow2" ]; then
+        ovmf_vars="/var/lib/libvirt/images/${vm_name}_VARS.qcow2"
+    else
+        ovmf_vars="/var/lib/libvirt/images/${vm_name}_VARS.fd"
+    fi
+
     sudo cp "$ovmf_src" "$ovmf_vars"
     success "OVMF VARS: $ovmf_src → $ovmf_vars"
 
@@ -629,23 +797,38 @@ cmd_vm_create() {
         warn "Windows 11 may refuse to install — try installing edk2-ovmf with SecureBoot support"
     fi
 
-    # Helper to parse PCI address (domain:bus:slot.function) into XML
+    # ── Anti-Detection: Generate Stealth Identifiers ────────────────────────
+
+    header "Anti-Detection Setup"
+
+    local stealth_mac
+    stealth_mac=$(generate_mac)
+    success "MAC Address: $stealth_mac (real vendor OUI)"
+
+    local stealth_disk_serial
+    stealth_disk_serial=$(generate_disk_serial)
+    success "Disk Serial: $stealth_disk_serial (Samsung NVMe pattern)"
+
+    local stealth_vendor_id
+    stealth_vendor_id=$(generate_vendor_id)
+    success "HyperV Vendor ID: $stealth_vendor_id (randomized)"
+
+
+
+    # Helper to parse PCI address into XML hostdev
     pci_hostdev_xml() {
         local pci_addr="$1"
         local guest_fn="${2:-0}"
         local multifunction="${3:-}"
-        # Parse: 0000:01:00.0 → domain=0000, bus=01, slot=00, function=0
         local domain bus slot function
         domain=$(echo "$pci_addr" | cut -d: -f1)
         bus=$(echo "$pci_addr" | cut -d: -f2)
         slot=$(echo "$pci_addr" | cut -d: -f3 | cut -d. -f1)
         function=$(echo "$pci_addr" | cut -d. -f2)
-
         local mf_attr=""
         if [ -n "$multifunction" ]; then
             mf_attr=" multifunction='on'"
         fi
-
         cat <<PCIEOF
     <hostdev mode='subsystem' type='pci' managed='yes'>
       <source>
@@ -657,9 +840,9 @@ PCIEOF
     }
 
     # Generate VM XML
-    info "Generating VM definition..."
+    header "Generating Stealth VM"
 
-    # Compute CPU topology — cores × threads must equal vm_cpus
+    # Compute CPU topology
     local topo_cores topo_threads
     if [ "$((vm_cpus % 2))" -eq 0 ] && [ "$vm_cpus" -gt 1 ]; then
         topo_cores=$((vm_cpus / 2))
@@ -671,22 +854,27 @@ PCIEOF
 
     local xml_path
     xml_path=$(mktemp "/tmp/${vm_name}.XXXXXX.xml")
+
     cat > "$xml_path" <<XMLEOF
 <domain type='kvm'>
   <name>$vm_name</name>
   <metadata>
     <dragonforge:vm xmlns:dragonforge="https://github.com/Ghosts-Protocol-Pvt-Ltd/DragonForge">
-      <dragonforge:version>1.0.0</dragonforge:version>
+      <dragonforge:version>2.0.0</dragonforge:version>
     </dragonforge:vm>
   </metadata>
   <memory unit='MiB'>$vm_ram</memory>
   <currentMemory unit='MiB'>$vm_ram</currentMemory>
   <vcpu placement='static'>$vm_cpus</vcpu>
   <iothreads>1</iothreads>
-  <os>
+  <os firmware='efi'>
     <type arch='x86_64' machine='q35'>hvm</type>
-    <loader readonly='yes' secure='yes' type='pflash'>$ovmf_code</loader>
-    <nvram>$ovmf_vars</nvram>
+    <firmware>
+      <feature enabled='yes' name='enrolled-keys'/>
+      <feature enabled='yes' name='secure-boot'/>
+    </firmware>
+    <loader readonly='yes' secure='yes' type='pflash' format='$ovmf_format'>$ovmf_code</loader>
+    <nvram template='$ovmf_src' templateFormat='$ovmf_format' format='$ovmf_format'>$ovmf_vars</nvram>
     <boot dev='cdrom'/>
     <boot dev='hd'/>
     <smbios mode='host'/>
@@ -703,22 +891,25 @@ PCIEOF
       <synic state='on'/>
       <stimer state='on'/>
       <frequencies state='on'/>
-      <vendor_id state='on' value='GenuineIntel'/>
+      <vendor_id state='on' value='$stealth_vendor_id'/>
     </hyperv>
     <kvm>
       <hidden state='on'/>
     </kvm>
     <vmport state='off'/>
     <smm state='on'/>
+    <ioapic driver='kvm'/>
   </features>
   <cpu mode='host-passthrough' check='none' migratable='off'>
     <topology sockets='1' dies='1' clusters='1' cores='$topo_cores' threads='$topo_threads'/>
+    <feature policy='disable' name='hypervisor'/>
   </cpu>
   <clock offset='localtime'>
     <timer name='rtc' tickpolicy='catchup'/>
     <timer name='pit' tickpolicy='delay'/>
     <timer name='hpet' present='no'/>
     <timer name='hypervclock' present='yes'/>
+    <timer name='tsc' present='yes' mode='native'/>
   </clock>
   <on_poweroff>destroy</on_poweroff>
   <on_reboot>restart</on_reboot>
@@ -730,38 +921,40 @@ PCIEOF
   <devices>
     <emulator>/usr/bin/qemu-system-x86_64</emulator>
 
-    <!-- VirtIO Disk -->
+    <!-- SATA Disk (stealth: no "Red Hat VirtIO" in Device Manager) -->
     <disk type='file' device='disk'>
-      <driver name='qemu' type='qcow2' cache='writeback' io='threads' discard='unmap' iothread='1' queues='4'/>
+      <driver name='qemu' type='qcow2' cache='writeback' discard='unmap'/>
       <source file='$disk_path'/>
-      <target dev='vda' bus='virtio'/>
+      <target dev='sda' bus='sata'/>
+      <serial>$stealth_disk_serial</serial>
     </disk>
 
     <!-- Windows ISO -->
     <disk type='file' device='cdrom'>
       <driver name='qemu' type='raw'/>
       <source file='$win_iso'/>
-      <target dev='sda' bus='sata'/>
+      <target dev='sdb' bus='sata'/>
       <readonly/>
     </disk>
 
-    <!-- VirtIO Drivers ISO -->
+    <!-- VirtIO Drivers ISO (optional — for post-install driver setup) -->
 $(if [ -n "$virtio_iso" ] && [ -f "$virtio_iso" ]; then
     echo "    <disk type='file' device='cdrom'>"
     echo "      <driver name='qemu' type='raw'/>"
     echo "      <source file='$virtio_iso'/>"
-    echo "      <target dev='sdb' bus='sata'/>"
+    echo "      <target dev='sdc' bus='sata'/>"
     echo "      <readonly/>"
     echo "    </disk>"
 fi)
 
-    <!-- Network -->
+    <!-- Network: Intel e1000e (stealth: looks like built-in Intel I219) -->
     <interface type='network'>
+      <mac address='$stealth_mac'/>
       <source network='default'/>
-      <model type='virtio'/>
+      <model type='e1000e'/>
     </interface>
 
-    <!-- SPICE Display (for initial setup) -->
+    <!-- SPICE Display (for initial setup — connect with virt-viewer) -->
     <graphics type='spice' autoport='yes' listen='127.0.0.1'>
       <listen type='address' address='127.0.0.1'/>
     </graphics>
@@ -774,7 +967,7 @@ fi)
     <input type='tablet' bus='usb'/>
     <input type='keyboard' bus='usb'/>
 
-    <!-- TPM 2.0 (for Windows 11 — must use tpm-crb, not tpm-tis) -->
+    <!-- TPM 2.0 (Windows 11 requirement — tpm-crb matches real hardware) -->
     <tpm model='tpm-crb'>
       <backend type='emulator' version='2.0'/>
     </tpm>
@@ -789,23 +982,36 @@ $(pci_hostdev_xml "$GPU_AUDIO" 1)
     </sound>
     <audio id='1' type='spice'/>
 
-    <!-- Balloon -->
-    <memballoon model='virtio'/>
+    <!-- Watchdog (matches real Intel ICH9 chipset) -->
+    <watchdog model='itco' action='reset'/>
 
-    <!-- RNG -->
-    <rng model='virtio'>
-      <backend model='random'>/dev/urandom</backend>
-    </rng>
+    <!-- Stealth: No balloon (removes virtio-balloon from PCI enumeration) -->
+    <memballoon model='none'/>
+
+    <!-- Stealth: No virtio-rng (removes another VM fingerprint) -->
   </devices>
 </domain>
 XMLEOF
 
-    success "VM XML generated: $xml_path"
+    success "Stealth VM XML generated: $xml_path"
+
+    # ── Anti-Detection Summary ──────────────────────────────────────────────
+    header "Stealth Features"
+    success "SMBIOS: Host passthrough ($(sudo dmidecode -s system-manufacturer 2>/dev/null) $(sudo dmidecode -s system-product-name 2>/dev/null))"
+    success "KVM: Hidden from CPUID (hypervisor bit disabled)"
+    success "HyperV: Random vendor ID ($stealth_vendor_id)"
+    success "CPU: Host passthrough with hypervisor feature disabled"
+    success "Disk: SATA (no VirtIO fingerprint) + realistic serial"
+    success "Network: Intel e1000e (no VirtIO fingerprint) + real vendor MAC"
+    success "Balloon: Disabled (no VirtIO balloon in PCI)"
+    success "RNG: Disabled (no VirtIO RNG in PCI)"
+    success "TSC: Native mode (reduces timing-based detection)"
+    success "TPM 2.0: CRB model (matches real hardware)"
+    success "Secure Boot: Enabled with pre-enrolled keys"
 
     # Define in libvirt
-    info "Defining VM in libvirt..."
+    header "Defining VM"
     if sudo virsh dominfo "$vm_name" &>/dev/null; then
-        # Stop if running
         local cur_state
         cur_state=$(sudo virsh domstate "$vm_name" 2>/dev/null || true)
         if [ "$cur_state" = "running" ] || [ "$cur_state" = "paused" ]; then
@@ -814,14 +1020,12 @@ XMLEOF
             sleep 1
         fi
 
-        # Get old UUID for targeted swtpm cleanup
         local old_uuid
         old_uuid=$(sudo virsh domuuid "$vm_name" 2>/dev/null || true)
 
         warn "VM '$vm_name' already defined — undefining (with NVRAM + TPM cleanup)"
         sudo virsh undefine "$vm_name" --nvram --tpm 2>/dev/null || true
 
-        # Clean up leftover swtpm state for THIS VM only (by UUID)
         if [ -n "$old_uuid" ]; then
             local swtpm_dir="/var/lib/libvirt/swtpm"
             if [ -d "$swtpm_dir/$old_uuid" ]; then
@@ -829,15 +1033,43 @@ XMLEOF
                 info "Cleared swtpm state for $old_uuid"
             fi
         fi
+
+        # Recopy OVMF VARS (undefine --nvram deleted the old one)
+        # Also clean up any leftover VARS in the other format
+        sudo rm -f "/var/lib/libvirt/images/${vm_name}_VARS.fd" 2>/dev/null || true
+        sudo rm -f "/var/lib/libvirt/images/${vm_name}_VARS.qcow2" 2>/dev/null || true
+        sudo cp "$ovmf_src" "$ovmf_vars"
+    fi
+
+    # Fix SELinux labels for TPM and OVMF files
+    if command -v restorecon &>/dev/null; then
+        sudo restorecon -F "$ovmf_vars" 2>/dev/null || true
+        sudo restorecon -RF /var/lib/libvirt/swtpm/ 2>/dev/null || true
+        success "SELinux labels restored for OVMF + swtpm"
     fi
 
     sudo virsh define "$xml_path"
     rm -f "$xml_path"
     success "VM defined: $vm_name"
 
-    header "VM Created"
-    info "Start with:  ${BOLD}./dragonforge vm-start${NC}"
-    info "View with:   ${BOLD}./dragonforge vm-viewer${NC}"
+    # Verify TPM state was created
+    local new_uuid
+    new_uuid=$(sudo virsh domuuid "$vm_name" 2>/dev/null || true)
+    if [ -n "$new_uuid" ] && [ -d "/var/lib/libvirt/swtpm/$new_uuid" ]; then
+        success "TPM state initialized (UUID: $new_uuid)"
+    else
+        info "TPM state will be created on first VM start"
+    fi
+
+    header "VM Created (Stealth Mode)"
+    info "Start with:  ${BOLD}./dragonforge start${NC}"
+    info "View with:   ${BOLD}./dragonforge viewer${NC}"
+    echo ""
+    local _mfg _prod
+    _mfg=$(sudo dmidecode -s system-manufacturer 2>/dev/null || echo "your hardware")
+    _prod=$(sudo dmidecode -s system-product-name 2>/dev/null || echo "")
+    info "${DIM}After Windows install + NVIDIA driver setup, the VM will appear"
+    info "as a genuine ${_mfg} ${_prod} to all software.${NC}"
     echo ""
 }
 
@@ -923,6 +1155,21 @@ cmd_vm_start() {
             sudo rm -rf "$stale_dir" 2>/dev/null || true
         fi
     done
+
+    # Clean up stale swtpm processes and log files
+    # Prevents SELinux label conflict: "Setting different SELinux label on ... which is already in use"
+    local stale_swtpm_log="/var/log/swtpm/libvirt/qemu/${vm_name}-swtpm.log"
+    if [ -f "$stale_swtpm_log" ]; then
+        # Kill any orphaned swtpm processes using this log
+        local swtpm_pids
+        swtpm_pids=$(sudo fuser "$stale_swtpm_log" 2>/dev/null | tr -s ' ')
+        if [ -n "$swtpm_pids" ]; then
+            warn "Killing stale swtpm processes: $swtpm_pids"
+            echo "$swtpm_pids" | xargs -r sudo kill -9 2>/dev/null || true
+            sleep 1
+        fi
+        sudo rm -f "$stale_swtpm_log" 2>/dev/null || true
+    fi
 
     info "Starting $vm_name..."
     if ! sudo virsh start "$vm_name" 2>&1; then

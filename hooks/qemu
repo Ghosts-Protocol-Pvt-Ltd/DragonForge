@@ -33,6 +33,7 @@ STATE_NAME="${3:-}"
 VM_NAME="${DRAGONFORGE_VM_NAME:-win11-dragonforge}"
 GPU_PCI="${DRAGONFORGE_GPU_PCI:-0000:01:00.0}"
 GPU_AUDIO="${DRAGONFORGE_GPU_AUDIO:-0000:01:00.1}"
+GPU_DRIVER="${DRAGONFORGE_GPU_DRIVER:-nvidia}"
 DEVICES="$GPU_PCI $GPU_AUDIO"
 
 # Timeout in seconds — if the hook takes longer than this, it self-terminates
@@ -185,7 +186,17 @@ if [ "$HOOK_NAME" = "prepare" ] && [ "$STATE_NAME" = "begin" ]; then
     check_gpu_temperature
 
     # Best-effort module unload (not required for device-level passthrough)
-    for mod in nvidia_drm nvidia_modeset nvidia_uvm nvidia; do
+    # Detect which GPU driver modules to try unloading
+    gpu_modules=()
+    case "$GPU_DRIVER" in
+        nvidia)   gpu_modules=(nvidia_drm nvidia_modeset nvidia_uvm nvidia) ;;
+        nouveau)  gpu_modules=(nouveau) ;;
+        amdgpu)   gpu_modules=(amdgpu) ;;
+        radeon)   gpu_modules=(radeon) ;;
+        *)        gpu_modules=(nvidia_drm nvidia_modeset nvidia_uvm nvidia nouveau amdgpu radeon) ;;
+    esac
+
+    for mod in "${gpu_modules[@]}"; do
         if lsmod | grep -q "^${mod}"; then
             if modprobe -r "$mod" 2>/dev/null; then
                 log "Unloaded $mod"
@@ -228,8 +239,7 @@ elif [ "$HOOK_NAME" = "release" ] && [ "$STATE_NAME" = "end" ]; then
     log "=== Returning GPU to host ==="
 
     # Clean up stale QEMU domain directory (prevents SELinux label conflicts on next start)
-    local qemu_domain_dir="/var/lib/libvirt/qemu/domain-*-${VM_NAME}"
-    for stale_dir in $qemu_domain_dir; do
+    for stale_dir in /var/lib/libvirt/qemu/domain-*-"${VM_NAME}"; do
         if [ -d "$stale_dir" ]; then
             log "Cleaning stale QEMU domain dir: $stale_dir"
             rm -rf "$stale_dir" 2>/dev/null || true
@@ -251,8 +261,17 @@ elif [ "$HOOK_NAME" = "release" ] && [ "$STATE_NAME" = "end" ]; then
     echo 1 > /sys/bus/pci/rescan 2>/dev/null || true
     sleep 2
 
-    # Best-effort reload nvidia stack
-    for mod in nvidia nvidia_modeset nvidia_uvm nvidia_drm; do
+    # Best-effort reload GPU driver stack
+    reload_modules=()
+    case "$GPU_DRIVER" in
+        nvidia)   reload_modules=(nvidia nvidia_modeset nvidia_uvm nvidia_drm) ;;
+        nouveau)  reload_modules=(nouveau) ;;
+        amdgpu)   reload_modules=(amdgpu) ;;
+        radeon)   reload_modules=(radeon) ;;
+        *)        reload_modules=(nvidia nvidia_modeset nvidia_uvm nvidia_drm) ;;
+    esac
+
+    for mod in "${reload_modules[@]}"; do
         if modprobe "$mod" 2>/dev/null; then
             log "Loaded $mod"
         else
@@ -260,15 +279,21 @@ elif [ "$HOOK_NAME" = "release" ] && [ "$STATE_NAME" = "end" ]; then
         fi
     done
 
-    # Explicit rebind: if the device didn't auto-claim, manually bind to nvidia
+    # Explicit rebind: if the device didn't auto-claim, manually bind to GPU driver
     sleep 1
     for dev in $DEVICES; do
-        local driver
         driver=$(basename "$(readlink "/sys/bus/pci/devices/$dev/driver" 2>/dev/null)" 2>/dev/null)
         if [ -z "$driver" ]; then
-            log "$dev has no driver — attempting explicit nvidia bind"
-            # Try nvidia first, then nouveau as fallback
-            for try_driver in nvidia nouveau; do
+            log "$dev has no driver — attempting explicit $GPU_DRIVER bind"
+            # Build list of drivers to try: configured driver first, then fallbacks
+            try_drivers=("$GPU_DRIVER")
+            case "$GPU_DRIVER" in
+                nvidia)   try_drivers+=(nouveau) ;;
+                nouveau)  try_drivers+=(nvidia) ;;
+                amdgpu)   try_drivers+=(radeon) ;;
+                radeon)   try_drivers+=(amdgpu) ;;
+            esac
+            for try_driver in "${try_drivers[@]}"; do
                 if [ -d "/sys/bus/pci/drivers/$try_driver" ]; then
                     echo "$dev" > "/sys/bus/pci/drivers/$try_driver/bind" 2>/dev/null && {
                         log "$dev explicitly bound to $try_driver"
