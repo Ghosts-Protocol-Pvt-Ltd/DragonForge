@@ -566,27 +566,25 @@ cmd_vm_create() {
         warn "Disk already exists: $disk_path"
     fi
 
-    # Copy OVMF VARS for secure boot
+    # Copy OVMF VARS for secure boot (always fresh — stale VARS breaks TPM/SecureBoot)
     local ovmf_vars="/var/lib/libvirt/images/${vm_name}_VARS.fd"
-    if [ ! -f "$ovmf_vars" ]; then
-        local ovmf_src=""
-        for candidate in \
-            /usr/share/edk2/ovmf/OVMF_VARS.secboot.fd \
-            /usr/share/OVMF/OVMF_VARS.ms.fd \
-            /usr/share/OVMF/OVMF_VARS.fd \
-            /usr/share/edk2/ovmf/OVMF_VARS.fd; do
-            if [ -f "$candidate" ]; then
-                ovmf_src="$candidate"
-                break
-            fi
-        done
-        if [ -n "$ovmf_src" ]; then
-            sudo cp "$ovmf_src" "$ovmf_vars"
-            success "OVMF VARS: $ovmf_vars"
-        else
-            error "No OVMF VARS template found. Install edk2-ovmf."
-            exit 1
+    local ovmf_src=""
+    for candidate in \
+        /usr/share/edk2/ovmf/OVMF_VARS.secboot.fd \
+        /usr/share/OVMF/OVMF_VARS.ms.fd \
+        /usr/share/OVMF/OVMF_VARS.fd \
+        /usr/share/edk2/ovmf/OVMF_VARS.fd; do
+        if [ -f "$candidate" ]; then
+            ovmf_src="$candidate"
+            break
         fi
+    done
+    if [ -n "$ovmf_src" ]; then
+        sudo cp "$ovmf_src" "$ovmf_vars"
+        success "OVMF VARS: $ovmf_vars (fresh copy)"
+    else
+        error "No OVMF VARS template found. Install edk2-ovmf."
+        exit 1
     fi
 
     # Find OVMF CODE
@@ -774,8 +772,26 @@ XMLEOF
     # Define in libvirt
     info "Defining VM in libvirt..."
     if sudo virsh dominfo "$vm_name" &>/dev/null; then
-        warn "VM '$vm_name' already defined — undefining first"
-        sudo virsh undefine "$vm_name" --nvram 2>/dev/null || true
+        # Stop if running
+        local cur_state
+        cur_state=$(sudo virsh domstate "$vm_name" 2>/dev/null || true)
+        if [ "$cur_state" = "running" ] || [ "$cur_state" = "paused" ]; then
+            warn "VM is $cur_state — destroying first"
+            sudo virsh destroy "$vm_name" 2>/dev/null || true
+            sleep 1
+        fi
+        warn "VM '$vm_name' already defined — undefining (with NVRAM + TPM cleanup)"
+        sudo virsh undefine "$vm_name" --nvram --tpm 2>/dev/null || true
+    fi
+
+    # Also nuke any leftover swtpm state (ensures clean TPM on next boot)
+    local swtpm_dir="/var/lib/libvirt/swtpm"
+    if [ -d "$swtpm_dir" ]; then
+        # Find and remove state dirs for this VM name (match by path contents)
+        for uuid_dir in "$swtpm_dir"/*/; do
+            [ -d "$uuid_dir" ] && sudo rm -rf "$uuid_dir"
+        done
+        info "Cleared swtpm state for fresh TPM"
     fi
 
     sudo virsh define "$xml_path"
