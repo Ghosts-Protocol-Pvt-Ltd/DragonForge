@@ -1057,6 +1057,73 @@ cmd_logs() {
     echo ""
 }
 
+# ── VM Delete ───────────────────────────────────────────────────────────────
+
+cmd_vm_delete() {
+    load_config
+    local vm_name="${VM_NAME:-win11-dragonforge}"
+    local disk_path="${VM_DISK_PATH:-/var/lib/libvirt/images/${vm_name}.qcow2}"
+    local ovmf_vars="/var/lib/libvirt/images/${vm_name}_VARS.fd"
+
+    print_banner
+    header "Deleting VM: $vm_name"
+
+    if [ "$EUID" -ne 0 ]; then
+        error "VM delete must be run as root (use sudo)"
+        exit 1
+    fi
+
+    # Stop if running
+    local state
+    state=$(virsh domstate "$vm_name" 2>/dev/null || echo "undefined")
+    if [ "$state" = "running" ] || [ "$state" = "paused" ]; then
+        warn "VM is $state — destroying first"
+        virsh destroy "$vm_name" 2>/dev/null || true
+        sleep 2
+    fi
+
+    # Undefine with full cleanup
+    if virsh dominfo "$vm_name" &>/dev/null; then
+        virsh undefine "$vm_name" --nvram --tpm 2>/dev/null || true
+        success "VM undefined"
+    else
+        info "VM not defined in libvirt"
+    fi
+
+    # Remove disk image
+    if [ -f "$disk_path" ]; then
+        rm -f "$disk_path"
+        success "Disk removed: $disk_path"
+    fi
+
+    # Remove OVMF VARS
+    if [ -f "$ovmf_vars" ]; then
+        rm -f "$ovmf_vars"
+        success "NVRAM removed: $ovmf_vars"
+    fi
+
+    # Remove swtpm state
+    local swtpm_dir="/var/lib/libvirt/swtpm"
+    if [ -d "$swtpm_dir" ]; then
+        local cleaned=0
+        for uuid_dir in "$swtpm_dir"/*/; do
+            if [ -d "$uuid_dir" ]; then
+                rm -rf "$uuid_dir"
+                cleaned=1
+            fi
+        done
+        if [ "$cleaned" -eq 1 ]; then
+            success "TPM state cleared"
+        fi
+    fi
+
+    echo ""
+    success "VM '$vm_name' fully deleted"
+    info "ISOs preserved — only VM artifacts removed"
+    info "Run ${BOLD}dragonforge create${NC} to build a new VM"
+    echo ""
+}
+
 # ── Uninstall ───────────────────────────────────────────────────────────────
 
 cmd_uninstall() {
@@ -1096,6 +1163,7 @@ case "$CMD" in
     vmkill|kill)            cmd_vm_kill ;;
     vmviewer|viewer)        cmd_vm_viewer ;;
     gpureset|reset)         cmd_gpu_reset ;;
+    vmdelete|delete)        cmd_vm_delete ;;
     logs|log)               cmd_logs "${2:-}" ;;
     uninstall|remove)       cmd_uninstall ;;
     help|*)
@@ -1112,6 +1180,7 @@ case "$CMD" in
         echo "    kill        Force stop the VM"
         echo "    viewer      Open SPICE viewer"
         echo "    reset       Emergency: return GPU to host (requires sudo)"
+        echo "    delete      Delete VM (disk, NVRAM, TPM — keeps ISOs)"
         echo "    logs        Show DragonForge log history"
         echo "    uninstall   Remove hook and VFIO config (requires sudo)"
         echo ""
