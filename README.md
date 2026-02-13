@@ -6,11 +6,12 @@ Pass your discrete NVIDIA or AMD GPU through to a Windows VM while keeping your 
 
 ## What It Does
 
-- **Detects** your GPU, IOMMU groups, and system readiness
-- **Configures** VFIO modules and libvirt hooks automatically  
+- **Auto-detects** your GPU, IOMMU groups, ISOs, and generates config automatically
+- **Configures** VFIO modules and libvirt hooks in one command
 - **Creates** a Windows 11 VM with UEFI, Secure Boot, TPM 2.0, VirtIO storage/network
 - **Manages** GPU bind/unbind at VM start/stop — no manual `modprobe` needed
 - **Works on laptops** — uses device-level unbind instead of kernel module unloading, so it doesn't crash your desktop when other processes (VS Code, compositor) are using the nvidia driver
+- **Self-healing** — 30s watchdog timer prevents stuck hooks, GPU temp checks refuse passthrough if overheating
 
 ## Requirements
 
@@ -35,38 +36,37 @@ cd DragonForge
 # 2. Make executable
 chmod +x dragonforge
 
-# 3. Detect your hardware
-./dragonforge detect
-
-# 4. Edit config with your values
-cp config/dragonforge.conf.example config/dragonforge.conf
-nano config/dragonforge.conf
-
-# 5. Install (requires sudo)
+# 3. Install (auto-detects GPU, generates config, installs hook)
 sudo ./dragonforge setup
 
-# 6. Reboot to load VFIO modules
+# 4. Reboot to load VFIO modules
 sudo reboot
 
-# 7. Create and start the VM
-./dragonforge vm-create
-./dragonforge vm-start
-./dragonforge vm-viewer
+# 5. Create and start the VM
+dragonforge create
+dragonforge start
+dragonforge viewer
 ```
+
+No manual config editing required — `setup` auto-detects your GPU, finds Windows/VirtIO ISOs in `~/Downloads`, and generates everything. Edit `config/dragonforge.conf` after if you want to tweak anything.
 
 ## Commands
 
+Hyphens are optional. `vm-start`, `vmstart`, and `start` all work.
+
 | Command | Description |
 |---------|-------------|
-| `./dragonforge detect` | Detect GPU, IOMMU groups, system info |
-| `./dragonforge setup` | Install hook + configure VFIO (requires sudo) |
-| `./dragonforge status` | Check current passthrough state |
-| `./dragonforge vm-create` | Create Windows 11 VM from config |
-| `./dragonforge vm-start` | Start the VM |
-| `./dragonforge vm-stop` | Gracefully shut down the VM |
-| `./dragonforge vm-kill` | Force stop the VM |
-| `./dragonforge vm-viewer` | Open SPICE viewer |
-| `./dragonforge uninstall` | Remove hook and VFIO config |
+| `dragonforge detect` | Detect GPU, IOMMU groups, system info |
+| `dragonforge setup` | Install hook, configure VFIO, create symlink (sudo) |
+| `dragonforge status` | Check current passthrough state |
+| `dragonforge create` | Create Windows 11 VM from config |
+| `dragonforge start` | Start the VM (with pre-flight checks) |
+| `dragonforge stop` | Gracefully shut down the VM |
+| `dragonforge kill` | Force stop the VM |
+| `dragonforge viewer` | Open SPICE viewer |
+| `dragonforge reset` | Emergency: return GPU to host (sudo) |
+| `dragonforge logs` | Show DragonForge log history |
+| `dragonforge uninstall` | Remove hook and VFIO config (sudo) |
 
 ## How GPU Passthrough Works
 
@@ -99,22 +99,38 @@ sudo reboot
 
 When you start the VM, libvirt calls our hook script which:
 
-1. **Unbinds** the GPU from the nvidia driver at the PCI device level
-2. **Binds** the GPU to `vfio-pci` (a stub driver that makes the device available to VMs)
-3. QEMU starts with the GPU passed through to Windows
+1. **Checks** GPU temperature — refuses passthrough if above the configured limit (default 85°C)
+2. **Starts** a 30-second watchdog timer — if the hook hangs, it self-terminates to prevent libvirtd lockups
+3. **Unbinds** the GPU from the nvidia driver at the PCI device level
+4. **Sets** `driver_override` to `vfio-pci` and binds the GPU
+5. QEMU starts with the GPU passed through to Windows
 
 When you stop the VM:
 
 1. **Unbinds** the GPU from `vfio-pci`
 2. **Clears** the driver override
 3. **Rescans** the PCI bus so nvidia can reclaim the GPU
-4. **Reloads** nvidia modules (best-effort)
+4. **Verifies** the nvidia driver re-attached successfully
+5. **Reloads** nvidia modules (best-effort)
 
-The key difference from most guides: we use `driver_override` + device unbind instead of `modprobe -r nvidia`. This means the hook **never hangs** even when other processes are using the nvidia driver.
+The key difference from most guides: we use `driver_override` + device unbind instead of `modprobe -r nvidia`. This means the hook **never hangs** even when other processes are using the nvidia driver. Plus the watchdog timer guarantees it can't deadlock libvirtd.
 
 ## Configuration
 
-Copy `config/dragonforge.conf.example` to `config/dragonforge.conf` and edit:
+Config is **auto-generated** when you run `dragonforge setup` (or any command that needs it). It detects:
+
+- Your first NVIDIA/AMD discrete GPU + audio device
+- Vendor:Device IDs from sysfs
+- Half your RAM (rounded to nearest GB, capped 4–16 GB)
+- Half your CPU threads (minimum 2)
+- Windows and VirtIO ISOs in `~/Downloads`
+
+To override, edit `config/dragonforge.conf` or create one from the example:
+
+```bash
+cp config/dragonforge.conf.example config/dragonforge.conf
+nano config/dragonforge.conf
+```
 
 ```bash
 # Find your GPU's PCI address and IDs
@@ -236,7 +252,10 @@ sudo virsh list --all
 ### GPU not returning to host after VM shutdown
 
 ```bash
-# Manually return GPU
+# Use the built-in emergency reset
+sudo dragonforge reset
+
+# Or manually:
 echo "0000:01:00.0" | sudo tee /sys/bus/pci/devices/0000:01:00.0/driver/unbind
 echo "" | sudo tee /sys/bus/pci/devices/0000:01:00.0/driver_override
 echo 1 | sudo tee /sys/bus/pci/rescan
@@ -247,16 +266,17 @@ sudo modprobe nvidia
 
 ```
 DragonForge/
-├── dragonforge              # Main CLI tool
+├── dragonforge                    # Main CLI tool (~1100 lines)
 ├── hooks/
-│   └── qemu                 # Libvirt QEMU hook script
+│   └── qemu                      # Libvirt QEMU hook (watchdog, temp check)
 ├── config/
-│   ├── dragonforge.conf.example  # Example configuration
-│   └── dragonforge.conf     # Your local config (git-ignored)
+│   ├── dragonforge.conf.example   # Example configuration
+│   └── dragonforge.conf           # Auto-generated local config (git-ignored)
 ├── docs/
-│   ├── LAPTOP_GUIDE.md      # Laptop-specific passthrough guide
-│   └── LOOKING_GLASS.md     # Looking Glass setup guide
-├── LICENSE                  # MIT License
+│   ├── LAPTOP_GUIDE.md            # Laptop-specific passthrough guide
+│   └── LOOKING_GLASS.md           # Looking Glass setup guide
+├── CONTRIBUTING.md
+├── LICENSE                        # MIT License
 └── README.md
 ```
 
