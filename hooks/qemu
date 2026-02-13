@@ -173,6 +173,14 @@ check_gpu_temperature() {
 if [ "$HOOK_NAME" = "prepare" ] && [ "$STATE_NAME" = "begin" ]; then
     log "=== Preparing GPU passthrough for $VM_NAME ==="
 
+    # Clean up stale QEMU domain directories (prevents SELinux master-key.aes conflicts)
+    for stale_dir in /var/lib/libvirt/qemu/domain-*-"${VM_NAME}"; do
+        if [ -d "$stale_dir" ]; then
+            log "Cleaning stale QEMU state: $stale_dir"
+            rm -rf "$stale_dir" 2>/dev/null || true
+        fi
+    done
+
     # Hardware health check
     check_gpu_temperature
 
@@ -219,6 +227,15 @@ if [ "$HOOK_NAME" = "prepare" ] && [ "$STATE_NAME" = "begin" ]; then
 elif [ "$HOOK_NAME" = "release" ] && [ "$STATE_NAME" = "end" ]; then
     log "=== Returning GPU to host ==="
 
+    # Clean up stale QEMU domain directory (prevents SELinux label conflicts on next start)
+    local qemu_domain_dir="/var/lib/libvirt/qemu/domain-*-${VM_NAME}"
+    for stale_dir in $qemu_domain_dir; do
+        if [ -d "$stale_dir" ]; then
+            log "Cleaning stale QEMU domain dir: $stale_dir"
+            rm -rf "$stale_dir" 2>/dev/null || true
+        fi
+    done
+
     # Unbind from vfio-pci
     for dev in $DEVICES; do
         unbind_device "$dev" || true
@@ -243,14 +260,31 @@ elif [ "$HOOK_NAME" = "release" ] && [ "$STATE_NAME" = "end" ]; then
         fi
     done
 
-    # Verify GPU has a driver again
+    # Explicit rebind: if the device didn't auto-claim, manually bind to nvidia
     sleep 1
     for dev in $DEVICES; do
+        local driver
         driver=$(basename "$(readlink "/sys/bus/pci/devices/$dev/driver" 2>/dev/null)" 2>/dev/null)
+        if [ -z "$driver" ]; then
+            log "$dev has no driver — attempting explicit nvidia bind"
+            # Try nvidia first, then nouveau as fallback
+            for try_driver in nvidia nouveau; do
+                if [ -d "/sys/bus/pci/drivers/$try_driver" ]; then
+                    echo "$dev" > "/sys/bus/pci/drivers/$try_driver/bind" 2>/dev/null && {
+                        log "$dev explicitly bound to $try_driver"
+                        break
+                    } || true
+                fi
+            done
+            # Final check
+            sleep 0.5
+            driver=$(basename "$(readlink "/sys/bus/pci/devices/$dev/driver" 2>/dev/null)" 2>/dev/null)
+        fi
+
         if [ -n "$driver" ]; then
             log "$dev returned to $driver"
         else
-            warn "$dev has no driver after release — may need manual intervention"
+            warn "$dev has no driver after release — may need 'dragonforge reset'"
         fi
     done
 

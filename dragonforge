@@ -463,27 +463,29 @@ ENVEOF
         sed -i '2i\\n# Source DragonForge config\nif [ -f /etc/libvirt/hooks/dragonforge.env ]; then source /etc/libvirt/hooks/dragonforge.env; fi' /etc/libvirt/hooks/qemu
     fi
 
-    # VFIO module autoload
+    # VFIO module autoload (modules only — NO device IDs)
+    # The hook handles dynamic bind/unbind per VM start/stop.
+    # Loading vfio modules at boot ensures they're available when the hook needs them.
     info "Configuring VFIO modules for boot..."
     cat > /etc/modules-load.d/dragonforge-vfio.conf <<EOF
 # DragonForge — VFIO modules for GPU passthrough
+# Modules loaded at boot so the hook can bind devices dynamically.
+# Device binding is handled by the libvirt hook, NOT by static vfio-pci ids.
 vfio-pci
 vfio
 vfio_iommu_type1
 EOF
     success "VFIO modules will load at boot"
 
-    # VFIO PCI IDs + softdep
-    info "Configuring VFIO PCI device binding..."
-    local audio_vendor_id="${GPU_AUDIO_VENDOR_ID:-$GPU_VENDOR_ID}"
-    local audio_device_id="${GPU_AUDIO_DEVICE_ID:-22be}"
-    cat > /etc/modprobe.d/dragonforge-vfio.conf <<EOF
-# DragonForge — Bind GPU to vfio-pci at boot
-options vfio-pci ids=$GPU_VENDOR_ID:$GPU_DEVICE_ID,$audio_vendor_id:$audio_device_id
-softdep nvidia pre: vfio-pci
-softdep nouveau pre: vfio-pci
-EOF
-    success "VFIO PCI binding configured"
+    # Remove any static vfio-pci device binding (conflicts with dynamic hook approach)
+    # Static binding (options vfio-pci ids=...) grabs the GPU at boot, preventing
+    # the host from using it. The hook-based approach lets the host use the GPU
+    # normally and only detaches it when the VM starts.
+    if [ -f /etc/modprobe.d/dragonforge-vfio.conf ]; then
+        rm -f /etc/modprobe.d/dragonforge-vfio.conf
+        success "Removed static VFIO PCI binding (hook handles this dynamically)"
+    fi
+    info "GPU stays on nvidia until VM start — hook handles passthrough dynamically"
 
     # Ensure required packages
     header "Checking Dependencies"
@@ -913,8 +915,22 @@ cmd_vm_start() {
     fi
     success "libvirtd is running"
 
+    # Clean up stale QEMU domain directories from previous crashed sessions
+    # This prevents SELinux master-key.aes label conflicts
+    for stale_dir in /var/lib/libvirt/qemu/domain-*-"${vm_name}"; do
+        if [ -d "$stale_dir" ]; then
+            warn "Cleaning stale QEMU state: $stale_dir"
+            sudo rm -rf "$stale_dir" 2>/dev/null || true
+        fi
+    done
+
     info "Starting $vm_name..."
-    sudo virsh start "$vm_name"
+    if ! sudo virsh start "$vm_name" 2>&1; then
+        error "Failed to start VM"
+        info "Check: sudo journalctl -u libvirtd -n 20"
+        info "Or try: ./dragonforge create  (to recreate VM definition)"
+        exit 1
+    fi
     success "$vm_name is running"
 
     echo ""
@@ -1057,14 +1073,38 @@ cmd_gpu_reset() {
         modprobe "$mod" 2>/dev/null || true
     done
 
-    # Verify
+    # Explicit rebind if device didn't auto-claim
+    sleep 1
     for dev in $gpu_pci $gpu_audio; do
         local driver
         driver=$(basename "$(readlink "/sys/bus/pci/devices/$dev/driver" 2>/dev/null)" 2>/dev/null)
+        if [ -z "$driver" ]; then
+            info "$dev has no driver — attempting explicit bind..."
+            for try_driver in nvidia nouveau; do
+                if [ -d "/sys/bus/pci/drivers/$try_driver" ]; then
+                    if echo "$dev" > "/sys/bus/pci/drivers/$try_driver/bind" 2>/dev/null; then
+                        success "$dev explicitly bound to $try_driver"
+                        break
+                    fi
+                fi
+            done
+            sleep 0.5
+            driver=$(basename "$(readlink "/sys/bus/pci/devices/$dev/driver" 2>/dev/null)" 2>/dev/null)
+        fi
+
         if [ -n "$driver" ] && [ "$driver" != "vfio-pci" ]; then
             success "$dev → $driver"
         else
             warn "$dev → ${driver:-no driver}"
+        fi
+    done
+
+    # Also clean stale QEMU domain directories
+    local vm_name="${VM_NAME:-win11-dragonforge}"
+    for stale_dir in /var/lib/libvirt/qemu/domain-*-"${vm_name}"; do
+        if [ -d "$stale_dir" ]; then
+            info "Cleaning stale QEMU state: $stale_dir"
+            rm -rf "$stale_dir" 2>/dev/null || true
         fi
     done
 
