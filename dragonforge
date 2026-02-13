@@ -638,7 +638,8 @@ PCIEOF
     # Generate VM XML
     info "Generating VM definition..."
 
-    local xml_path="/tmp/${vm_name}.xml"
+    local xml_path
+    xml_path=$(mktemp "/tmp/${vm_name}.XXXXXX.xml")
     cat > "$xml_path" <<XMLEOF
 <domain type='kvm'>
   <name>$vm_name</name>
@@ -658,7 +659,7 @@ PCIEOF
       <feature enabled='yes' name='secure-boot'/>
     </firmware>
     <loader readonly='yes' secure='yes' type='pflash'>$ovmf_code</loader>
-    <nvram template='$ovmf_code'>$ovmf_vars</nvram>
+    <nvram>$ovmf_vars</nvram>
     <boot dev='cdrom'/>
     <boot dev='hd'/>
   </os>
@@ -782,6 +783,7 @@ XMLEOF
     fi
 
     sudo virsh define "$xml_path"
+    rm -f "$xml_path"
     success "VM defined: $vm_name"
 
     header "VM Created"
@@ -906,10 +908,10 @@ cmd_vm_stop() {
                 success "GPU returned to host ($driver)"
             elif [ "$driver" = "vfio-pci" ]; then
                 warn "GPU still on vfio-pci — hook release may have failed"
-                info "Run: sudo ./dragonforge gpu-reset"
+                info "Run: sudo dragonforge reset"
             else
                 warn "GPU has no driver — may need PCI rescan"
-                info "Run: sudo echo 1 > /sys/bus/pci/rescan"
+                info "Run: sudo dragonforge reset"
             fi
             return 0
         fi
@@ -1026,7 +1028,7 @@ cmd_gpu_reset() {
 
 cmd_logs() {
     local log_file="/var/log/dragonforge.log"
-    local lines="${2:-50}"
+    local lines="${1:-50}"
 
     if [ -f "$log_file" ]; then
         info "Last $lines lines from $log_file:"
@@ -1058,9 +1060,11 @@ cmd_uninstall() {
     rm -f /etc/libvirt/hooks/dragonforge.env
     rm -f /etc/modules-load.d/dragonforge-vfio.conf
     rm -f /etc/modprobe.d/dragonforge-vfio.conf
+    rm -f /usr/local/bin/dragonforge
 
     success "Hook removed"
     success "VFIO configs removed"
+    success "Symlink removed"
     info "Reboot to fully revert changes"
     echo ""
 }
@@ -1080,7 +1084,7 @@ case "$CMD" in
     vmkill|kill)            cmd_vm_kill ;;
     vmviewer|viewer)        cmd_vm_viewer ;;
     gpureset|reset)         cmd_gpu_reset ;;
-    logs|log)               cmd_logs ;;
+    logs|log)               cmd_logs "${2:-}" ;;
     uninstall|remove)       cmd_uninstall ;;
     help|*)
         print_banner
