@@ -747,8 +747,8 @@ fi)
     <input type='tablet' bus='usb'/>
     <input type='keyboard' bus='usb'/>
 
-    <!-- TPM 2.0 (for Windows 11) -->
-    <tpm model='tpm-tis'>
+    <!-- TPM 2.0 (for Windows 11 — must use tpm-crb, not tpm-tis) -->
+    <tpm model='tpm-crb'>
       <backend type='emulator' version='2.0'/>
     </tpm>
 
