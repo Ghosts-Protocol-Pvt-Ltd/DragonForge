@@ -354,6 +354,16 @@ EOF
         info "  Ubuntu:  sudo apt install qemu-kvm libvirt-daemon virt-manager virt-viewer swtpm"
     fi
 
+    # Create symlink so 'dragonforge' works from anywhere
+    local symlink_target="/usr/local/bin/dragonforge"
+    local script_path
+    script_path=$(realpath "$SCRIPT_DIR/dragonforge")
+    if [ -L "$symlink_target" ] || [ -e "$symlink_target" ]; then
+        rm -f "$symlink_target"
+    fi
+    ln -s "$script_path" "$symlink_target"
+    success "Symlink: dragonforge → $script_path"
+
     # Restart libvirtd
     info "Restarting libvirtd..."
     systemctl restart libvirtd
@@ -361,9 +371,10 @@ EOF
 
     header "Setup Complete"
     success "DragonForge is installed"
+    info "You can now run ${BOLD}dragonforge${NC} from anywhere"
     info "Reboot to apply VFIO module changes, then run:"
-    info "  ${BOLD}./dragonforge vm-create${NC}  — Create a Windows VM"
-    info "  ${BOLD}./dragonforge vm-start${NC}   — Start the VM"
+    info "  ${BOLD}dragonforge create${NC}  — Create a Windows VM"
+    info "  ${BOLD}dragonforge start${NC}   — Start the VM"
     echo ""
 }
 
@@ -920,34 +931,39 @@ cmd_uninstall() {
 
 # ── Main ────────────────────────────────────────────────────────────────────
 
-case "${1:-help}" in
-    detect)     cmd_detect ;;
-    setup)      cmd_setup ;;
-    status)     cmd_status ;;
-    vm-create)  cmd_vm_create ;;
-    vm-start)   cmd_vm_start ;;
-    vm-stop)    cmd_vm_stop ;;
-    vm-kill)    cmd_vm_kill ;;
-    vm-viewer)  cmd_vm_viewer ;;
-    gpu-reset)  cmd_gpu_reset ;;
-    logs)       cmd_logs ;;
-    uninstall)  cmd_uninstall ;;
+# Normalize command: strip hyphens so "vmstart" = "vm-start"
+CMD=$(echo "${1:-help}" | tr -d '-')
+
+case "$CMD" in
+    detect)                 cmd_detect ;;
+    setup|install)          cmd_setup ;;
+    status)                 cmd_status ;;
+    vmcreate|create)        cmd_vm_create ;;
+    vmstart|start)          cmd_vm_start ;;
+    vmstop|stop)            cmd_vm_stop ;;
+    vmkill|kill)            cmd_vm_kill ;;
+    vmviewer|viewer)        cmd_vm_viewer ;;
+    gpureset|reset)         cmd_gpu_reset ;;
+    logs|log)               cmd_logs ;;
+    uninstall|remove)       cmd_uninstall ;;
     help|*)
         print_banner
-        echo "  Usage: ./dragonforge <command>"
+        echo "  Usage: dragonforge <command>"
         echo ""
         echo "  Commands:"
         echo "    detect      Detect GPU, IOMMU groups, system info"
         echo "    setup       Install hook + configure VFIO (requires sudo)"
         echo "    status      Check passthrough state"
-        echo "    vm-create   Create Windows 11 VM from config"
-        echo "    vm-start    Start the VM (with pre-flight checks)"
-        echo "    vm-stop     Gracefully shut down the VM"
-        echo "    vm-kill     Force stop the VM"
-        echo "    vm-viewer   Open SPICE viewer"
-        echo "    gpu-reset   Emergency: return GPU to host (requires sudo)"
+        echo "    create      Create Windows 11 VM from config"
+        echo "    start       Start the VM (with pre-flight checks)"
+        echo "    stop        Gracefully shut down the VM"
+        echo "    kill        Force stop the VM"
+        echo "    viewer      Open SPICE viewer"
+        echo "    reset       Emergency: return GPU to host (requires sudo)"
         echo "    logs        Show DragonForge log history"
         echo "    uninstall   Remove hook and VFIO config (requires sudo)"
+        echo ""
+        echo "  Aliases: vm-start, vmstart, start all work. Hyphens are optional."
         echo ""
         ;;
 esac
