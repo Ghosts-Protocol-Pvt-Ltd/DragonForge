@@ -652,16 +652,13 @@ PCIEOF
   <currentMemory unit='MiB'>$vm_ram</currentMemory>
   <vcpu placement='static'>$vm_cpus</vcpu>
   <iothreads>1</iothreads>
-  <os firmware='efi'>
+  <os>
     <type arch='x86_64' machine='q35'>hvm</type>
-    <firmware>
-      <feature enabled='yes' name='enrolled-keys'/>
-      <feature enabled='yes' name='secure-boot'/>
-    </firmware>
     <loader readonly='yes' secure='yes' type='pflash'>$ovmf_code</loader>
     <nvram>$ovmf_vars</nvram>
     <boot dev='cdrom'/>
     <boot dev='hd'/>
+    <smbios mode='host'/>
   </os>
   <features>
     <acpi/>
@@ -684,8 +681,7 @@ PCIEOF
     <smm state='on'/>
   </features>
   <cpu mode='host-passthrough' check='none' migratable='off'>
-    <topology sockets='1' dies='1' clusters='1' cores='$(( vm_cpus / 2 ))' threads='2'/>
-    <feature policy='require' name='topoext'/>
+    <topology sockets='1' dies='1' clusters='1' cores='$(( vm_cpus > 1 ? vm_cpus / 2 : 1 ))' threads='$(( vm_cpus > 1 ? 2 : 1 ))'/>
   </cpu>
   <clock offset='localtime'>
     <timer name='rtc' tickpolicy='catchup'/>
