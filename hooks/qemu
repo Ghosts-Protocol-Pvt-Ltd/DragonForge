@@ -10,42 +10,94 @@
 # (like a desktop compositor or VS Code) are using the nvidia driver —
 # the specific PCI device gets detached, not the entire driver stack.
 #
+# SAFETY:
+#   - No `set -e` — individual command failures are handled gracefully
+#   - Built-in timeout watchdog prevents hook from locking libvirtd
+#   - GPU temperature check before passthrough (thermal protection)
+#   - All operations logged to /var/log/dragonforge.log
+#
 # Install: sudo cp hooks/qemu /etc/libvirt/hooks/qemu
 #          sudo chmod +x /etc/libvirt/hooks/qemu
 # ============================================================================
 
-set -euo pipefail
+# NOTE: Do NOT use `set -e` here. If a best-effort command (like modprobe -r)
+# fails, we must continue to the next step, not abort the entire hook.
+set -uo pipefail
 
-GUEST_NAME="$1"
-HOOK_NAME="$2"
-STATE_NAME="$3"
+GUEST_NAME="${1:-}"
+HOOK_NAME="${2:-}"
+STATE_NAME="${3:-}"
 
 # ── Configuration ───────────────────────────────────────────────────────────
-# Edit these to match your system. Run `dragonforge detect` to find them.
 
 VM_NAME="${DRAGONFORGE_VM_NAME:-win11-dragonforge}"
-
-# GPU PCI addresses (bus:device.function)
 GPU_PCI="${DRAGONFORGE_GPU_PCI:-0000:01:00.0}"
 GPU_AUDIO="${DRAGONFORGE_GPU_AUDIO:-0000:01:00.1}"
-
-# All devices to pass through (space-separated)
 DEVICES="$GPU_PCI $GPU_AUDIO"
+
+# Timeout in seconds — if the hook takes longer than this, it self-terminates
+# to prevent libvirtd from hanging forever.
+HOOK_TIMEOUT="${DRAGONFORGE_HOOK_TIMEOUT:-30}"
+
+# GPU temperature threshold (°C) — refuse passthrough if GPU is too hot
+GPU_TEMP_MAX="${DRAGONFORGE_GPU_TEMP_MAX:-85}"
+
+# Log file
+LOG_FILE="/var/log/dragonforge.log"
 
 # ── Logging ─────────────────────────────────────────────────────────────────
 
 LOG_TAG="DragonForge"
 
-log()  { echo "$LOG_TAG: $1"; logger -t "$LOG_TAG" "$1"; }
-warn() { echo "$LOG_TAG: WARNING: $1" >&2; logger -t "$LOG_TAG" "WARNING: $1"; }
-die()  { echo "$LOG_TAG: FATAL: $1" >&2; logger -t "$LOG_TAG" "FATAL: $1"; exit 1; }
+log() {
+    local msg="$LOG_TAG: $1"
+    echo "$msg"
+    logger -t "$LOG_TAG" "$1" 2>/dev/null || true
+    echo "$(date '+%Y-%m-%d %H:%M:%S') $msg" >> "$LOG_FILE" 2>/dev/null || true
+}
+
+warn() {
+    local msg="$LOG_TAG: WARNING: $1"
+    echo "$msg" >&2
+    logger -t "$LOG_TAG" "WARNING: $1" 2>/dev/null || true
+    echo "$(date '+%Y-%m-%d %H:%M:%S') $msg" >> "$LOG_FILE" 2>/dev/null || true
+}
+
+die() {
+    local msg="$LOG_TAG: FATAL: $1"
+    echo "$msg" >&2
+    logger -t "$LOG_TAG" "FATAL: $1" 2>/dev/null || true
+    echo "$(date '+%Y-%m-%d %H:%M:%S') $msg" >> "$LOG_FILE" 2>/dev/null || true
+    exit 1
+}
 
 # ── Guard ───────────────────────────────────────────────────────────────────
-# Only act on our VM
 
-if [ "$GUEST_NAME" != "$VM_NAME" ]; then
+if [ -z "$GUEST_NAME" ] || [ "$GUEST_NAME" != "$VM_NAME" ]; then
     exit 0
 fi
+
+# ── Timeout Watchdog ────────────────────────────────────────────────────────
+# Prevents the hook from hanging indefinitely (which locks libvirtd).
+# If the hook doesn't finish within HOOK_TIMEOUT seconds, it kills itself.
+
+_watchdog_cleanup() {
+    # Kill the watchdog background process on normal exit
+    if [ -n "${WATCHDOG_PID:-}" ]; then
+        kill "$WATCHDOG_PID" 2>/dev/null || true
+        wait "$WATCHDOG_PID" 2>/dev/null || true
+    fi
+}
+trap _watchdog_cleanup EXIT
+
+(
+    sleep "$HOOK_TIMEOUT"
+    warn "Hook timeout after ${HOOK_TIMEOUT}s — self-terminating to prevent libvirtd hang"
+    kill -TERM $$ 2>/dev/null || true
+    sleep 2
+    kill -KILL $$ 2>/dev/null || true
+) &
+WATCHDOG_PID=$!
 
 # ── Helpers ─────────────────────────────────────────────────────────────────
 
@@ -53,28 +105,37 @@ unbind_device() {
     local dev="$1"
     if [ -e "/sys/bus/pci/devices/$dev/driver" ]; then
         local current_driver
-        current_driver=$(basename "$(readlink "/sys/bus/pci/devices/$dev/driver")")
-        log "Unbinding $dev from $current_driver"
-        echo "$dev" > "/sys/bus/pci/devices/$dev/driver/unbind" || warn "Failed to unbind $dev"
-        # Wait for unbind to complete
+        current_driver=$(basename "$(readlink "/sys/bus/pci/devices/$dev/driver" 2>/dev/null)" 2>/dev/null)
+        log "Unbinding $dev from ${current_driver:-unknown}"
+        echo "$dev" > "/sys/bus/pci/devices/$dev/driver/unbind" 2>/dev/null || {
+            warn "Failed to unbind $dev"
+            return 1
+        }
+        # Wait for unbind to complete (max 5s)
         local i=0
-        while [ -e "/sys/bus/pci/devices/$dev/driver" ] && [ $i -lt 10 ]; do
+        while [ -e "/sys/bus/pci/devices/$dev/driver" ] && [ "$i" -lt 10 ]; do
             sleep 0.5
             i=$((i + 1))
         done
         if [ -e "/sys/bus/pci/devices/$dev/driver" ]; then
             warn "$dev still bound after 5s wait"
+            return 1
         fi
     else
-        log "$dev has no driver bound"
+        log "$dev has no driver bound — OK"
     fi
+    return 0
 }
 
 bind_vfio() {
     local dev="$1"
     log "Binding $dev to vfio-pci"
-    echo "vfio-pci" > "/sys/bus/pci/devices/$dev/driver_override"
+    if ! echo "vfio-pci" > "/sys/bus/pci/devices/$dev/driver_override" 2>/dev/null; then
+        warn "Failed to set driver_override for $dev"
+        return 1
+    fi
     echo "$dev" > /sys/bus/pci/drivers/vfio-pci/bind 2>/dev/null || true
+    return 0
 }
 
 verify_vfio() {
@@ -85,9 +146,26 @@ verify_vfio() {
         log "$dev OK — bound to vfio-pci"
         return 0
     else
-        warn "$dev is on '$driver', expected vfio-pci"
+        warn "$dev is on '${driver:-none}', expected vfio-pci"
         return 1
     fi
+}
+
+check_gpu_temperature() {
+    # Check GPU temperature via nvidia-smi (if available)
+    if ! command -v nvidia-smi &>/dev/null; then
+        log "nvidia-smi not available — skipping temperature check"
+        return 0
+    fi
+    local temp
+    temp=$(nvidia-smi --query-gpu=temperature.gpu --format=csv,noheader,nounits 2>/dev/null | head -1)
+    if [ -n "$temp" ] && [ "$temp" -gt 0 ] 2>/dev/null; then
+        log "GPU temperature: ${temp}°C (max: ${GPU_TEMP_MAX}°C)"
+        if [ "$temp" -ge "$GPU_TEMP_MAX" ]; then
+            die "GPU temperature ${temp}°C exceeds safe limit ${GPU_TEMP_MAX}°C — aborting passthrough to protect hardware"
+        fi
+    fi
+    return 0
 }
 
 # ── Prepare: Detach GPU for VM ──────────────────────────────────────────────
@@ -95,30 +173,42 @@ verify_vfio() {
 if [ "$HOOK_NAME" = "prepare" ] && [ "$STATE_NAME" = "begin" ]; then
     log "=== Preparing GPU passthrough for $VM_NAME ==="
 
+    # Hardware health check
+    check_gpu_temperature
+
     # Best-effort module unload (not required for device-level passthrough)
     for mod in nvidia_drm nvidia_modeset nvidia_uvm nvidia; do
         if lsmod | grep -q "^${mod}"; then
-            modprobe -r "$mod" 2>/dev/null && log "Unloaded $mod" || log "$mod in use, skipping (device-level passthrough)"
+            if modprobe -r "$mod" 2>/dev/null; then
+                log "Unloaded $mod"
+            else
+                log "$mod in use — skipping (device-level passthrough will handle it)"
+            fi
         fi
     done
 
     # Unbind each device from its current driver
     for dev in $DEVICES; do
-        unbind_device "$dev"
+        unbind_device "$dev" || true
     done
+
+    # Small settle delay for kernel to process unbinds
+    sleep 0.5
 
     # Bind each device to vfio-pci
     for dev in $DEVICES; do
-        bind_vfio "$dev"
+        bind_vfio "$dev" || true
     done
 
     # Verify all devices are on vfio-pci
-    FAILED=0
+    verify_failed=0
     for dev in $DEVICES; do
-        verify_vfio "$dev" || FAILED=1
+        if ! verify_vfio "$dev"; then
+            verify_failed=1
+        fi
     done
 
-    if [ "$FAILED" -eq 1 ]; then
+    if [ "$verify_failed" -eq 1 ]; then
         die "One or more devices failed to bind to vfio-pci. Aborting VM start."
     fi
 
@@ -131,7 +221,7 @@ elif [ "$HOOK_NAME" = "release" ] && [ "$STATE_NAME" = "end" ]; then
 
     # Unbind from vfio-pci
     for dev in $DEVICES; do
-        unbind_device "$dev"
+        unbind_device "$dev" || true
     done
 
     # Clear driver override so the original driver can reclaim
@@ -141,12 +231,27 @@ elif [ "$HOOK_NAME" = "release" ] && [ "$STATE_NAME" = "end" ]; then
 
     # Trigger PCI rescan
     log "Rescanning PCI bus"
-    echo 1 > /sys/bus/pci/rescan
+    echo 1 > /sys/bus/pci/rescan 2>/dev/null || true
     sleep 2
 
     # Best-effort reload nvidia stack
     for mod in nvidia nvidia_modeset nvidia_uvm nvidia_drm; do
-        modprobe "$mod" 2>/dev/null && log "Loaded $mod" || log "Could not load $mod"
+        if modprobe "$mod" 2>/dev/null; then
+            log "Loaded $mod"
+        else
+            log "Could not load $mod (may not be needed)"
+        fi
+    done
+
+    # Verify GPU has a driver again
+    sleep 1
+    for dev in $DEVICES; do
+        driver=$(basename "$(readlink "/sys/bus/pci/devices/$dev/driver" 2>/dev/null)" 2>/dev/null)
+        if [ -n "$driver" ]; then
+            log "$dev returned to $driver"
+        else
+            warn "$dev has no driver after release — may need manual intervention"
+        fi
     done
 
     log "=== GPU returned to host ==="

@@ -75,7 +75,7 @@ cmd_detect() {
     # QEMU
     if command -v qemu-system-x86_64 &>/dev/null; then
         local qemu_ver
-        qemu_ver=$(qemu-system-x86_64 --version | head -1 | grep -oP '\d+\.\d+(\.\d+)?')
+        qemu_ver=$(qemu-system-x86_64 --version | head -1 | grep -oP '\d+\.\d+(\.\d+)?' | head -1)
         success "QEMU: $qemu_ver"
     else
         error "QEMU not found"
@@ -100,10 +100,14 @@ cmd_detect() {
     # IOMMU
     header "IOMMU Status"
 
-    if dmesg 2>/dev/null | grep -qi "IOMMU enabled\|DMAR:.*IOMMU\|Adding to iommu group"; then
+    # Check sysfs first (doesn't need root), then dmesg as fallback
+    if [ -d /sys/class/iommu ] && [ -n "$(ls -A /sys/class/iommu 2>/dev/null)" ]; then
         success "IOMMU is enabled"
-    elif [ -d /sys/class/iommu ] && [ "$(ls /sys/class/iommu 2>/dev/null)" ]; then
-        success "IOMMU is enabled"
+        local group_count
+        group_count=$(find /sys/kernel/iommu_groups -maxdepth 1 -mindepth 1 -type d 2>/dev/null | wc -l)
+        info "IOMMU groups found: ${BOLD}$group_count${NC}"
+    elif dmesg 2>/dev/null | grep -qi "IOMMU enabled\|DMAR:.*IOMMU\|Adding to iommu group"; then
+        success "IOMMU is enabled (detected via dmesg)"
     else
         error "IOMMU does not appear to be enabled"
         info "Add 'intel_iommu=on iommu=pt' (Intel) or 'amd_iommu=on iommu=pt' (AMD) to kernel params"
@@ -128,13 +132,21 @@ cmd_detect() {
 
     local gpu_found=0
     while IFS= read -r line; do
-        local bdf vendor_id device_id desc
+        local bdf desc
         bdf=$(echo "$line" | awk '{print $1}')
         desc=$(echo "$line" | cut -d' ' -f2-)
 
         if echo "$desc" | grep -qiE "nvidia|radeon|amd.*navi|amd.*vega"; then
-            vendor_id=$(cat "/sys/bus/pci/devices/0000:$bdf/vendor" 2>/dev/null | sed 's/^0x//')
-            device_id=$(cat "/sys/bus/pci/devices/0000:$bdf/device" 2>/dev/null | sed 's/^0x//')
+            # bdf may include domain (e.g. 0000:01:00.0) or not (01:00.0)
+            # sysfs always uses the full domain:bus:slot.function format
+            local sysfs_bdf="$bdf"
+            if [[ ! "$bdf" =~ ^[0-9a-fA-F]{4}: ]]; then
+                sysfs_bdf="0000:$bdf"
+            fi
+
+            local vendor_id device_id
+            vendor_id=$(cat "/sys/bus/pci/devices/$sysfs_bdf/vendor" 2>/dev/null | sed 's/^0x//')
+            device_id=$(cat "/sys/bus/pci/devices/$sysfs_bdf/device" 2>/dev/null | sed 's/^0x//')
 
             echo -e "  ${GREEN}►${NC} ${BOLD}$bdf${NC}"
             echo -e "    $desc"
@@ -142,25 +154,25 @@ cmd_detect() {
 
             # IOMMU group
             local iommu_group
-            iommu_group=$(basename "$(readlink "/sys/bus/pci/devices/0000:$bdf/iommu_group" 2>/dev/null)" 2>/dev/null)
+            iommu_group=$(basename "$(readlink "/sys/bus/pci/devices/$sysfs_bdf/iommu_group" 2>/dev/null)" 2>/dev/null)
             if [ -n "$iommu_group" ]; then
                 echo -e "    ${DIM}IOMMU Group: $iommu_group${NC}"
 
                 # List other devices in same group
                 local group_members
-                group_members=$(ls "/sys/kernel/iommu_groups/$iommu_group/devices/" 2>/dev/null | tr '\n' ' ')
+                group_members=$(find "/sys/kernel/iommu_groups/$iommu_group/devices/" -maxdepth 1 -mindepth 1 -printf '%f ' 2>/dev/null)
                 echo -e "    ${DIM}Group members: $group_members${NC}"
             fi
 
             # Current driver
             local driver
-            driver=$(basename "$(readlink "/sys/bus/pci/devices/0000:$bdf/driver" 2>/dev/null)" 2>/dev/null)
+            driver=$(basename "$(readlink "/sys/bus/pci/devices/$sysfs_bdf/driver" 2>/dev/null)" 2>/dev/null)
             echo -e "    ${DIM}Driver: ${driver:-none}${NC}"
 
             echo ""
             gpu_found=1
         fi
-    done < <(lspci -nn 2>/dev/null | grep -iE "VGA|3D|Display|Audio" || true)
+    done < <(lspci -Dnn 2>/dev/null | grep -iE "VGA|3D|Display|Audio" || true)
 
     if [ "$gpu_found" -eq 0 ]; then
         warn "No discrete GPU found"
@@ -201,11 +213,16 @@ cmd_status() {
     # VM state
     header "VM State"
     local vm_state
-    vm_state=$(sudo virsh domstate "$vm_name" 2>/dev/null || echo "undefined")
+    vm_state=$(sudo virsh domstate "$vm_name" 2>/dev/null | head -1 || echo "undefined")
+    vm_state=$(echo "$vm_state" | tr -d '[:space:]')  # trim whitespace
+    if [ -z "$vm_state" ]; then vm_state="undefined"; fi
+
     if [ "$vm_state" = "running" ]; then
         success "VM is running"
-    elif [ "$vm_state" = "shut off" ]; then
+    elif [ "$vm_state" = "shutoff" ]; then
         info "VM is shut off"
+    elif [ "$vm_state" = "undefined" ]; then
+        warn "VM not created yet — run './dragonforge vm-create'"
     else
         warn "VM state: $vm_state"
     fi
@@ -232,7 +249,7 @@ cmd_status() {
         warn "Hook not installed"
     fi
 
-    if [ -f /etc/modules-load.d/dragonforge-vfio.conf ]; then
+    if [ -f /etc/modules-load.d/dragonforge-vfio.conf ] || [ -f /etc/modules-load.d/vfio.conf ]; then
         success "VFIO modules configured for boot"
     else
         warn "VFIO module autoload not configured"
@@ -434,6 +451,33 @@ cmd_vm_create() {
         exit 1
     fi
 
+    # Helper to parse PCI address (domain:bus:slot.function) into XML
+    pci_hostdev_xml() {
+        local pci_addr="$1"
+        local guest_fn="${2:-0}"
+        local multifunction="${3:-}"
+        # Parse: 0000:01:00.0 → domain=0000, bus=01, slot=00, function=0
+        local domain bus slot function
+        domain=$(echo "$pci_addr" | cut -d: -f1)
+        bus=$(echo "$pci_addr" | cut -d: -f2)
+        slot=$(echo "$pci_addr" | cut -d: -f3 | cut -d. -f1)
+        function=$(echo "$pci_addr" | cut -d. -f2)
+
+        local mf_attr=""
+        if [ -n "$multifunction" ]; then
+            mf_attr=" multifunction='on'"
+        fi
+
+        cat <<PCIEOF
+    <hostdev mode='subsystem' type='pci' managed='yes'>
+      <source>
+        <address domain='0x${domain}' bus='0x${bus}' slot='0x${slot}' function='0x${function}'/>
+      </source>
+      <address type='pci' domain='0x0000' bus='0x06' slot='0x00' function='0x${guest_fn}'${mf_attr}/>
+    </hostdev>
+PCIEOF
+    }
+
     # Generate VM XML
     info "Generating VM definition..."
 
@@ -551,18 +595,8 @@ fi)
     </tpm>
 
     <!-- GPU Passthrough -->
-    <hostdev mode='subsystem' type='pci' managed='yes'>
-      <source>
-        <address domain='0x0000' bus='0x$(echo $GPU_PCI | cut -d: -f1)' slot='0x$(echo $GPU_PCI | cut -d: -f2 | cut -d. -f1)' function='0x$(echo $GPU_PCI | cut -d. -f2)'/>
-      </source>
-      <address type='pci' domain='0x0000' bus='0x06' slot='0x00' function='0x0' multifunction='on'/>
-    </hostdev>
-    <hostdev mode='subsystem' type='pci' managed='yes'>
-      <source>
-        <address domain='0x0000' bus='0x$(echo $GPU_AUDIO | cut -d: -f1)' slot='0x$(echo $GPU_AUDIO | cut -d: -f2 | cut -d. -f1)' function='0x$(echo $GPU_AUDIO | cut -d. -f2)'/>
-      </source>
-      <address type='pci' domain='0x0000' bus='0x06' slot='0x00' function='0x1'/>
-    </hostdev>
+$(pci_hostdev_xml "$GPU_PCI" 0 on)
+$(pci_hostdev_xml "$GPU_AUDIO" 1)
 
     <!-- Audio (through SPICE) -->
     <sound model='ich9'>
@@ -603,57 +637,175 @@ XMLEOF
 
 cmd_vm_start() {
     local conf="$SCRIPT_DIR/config/dragonforge.conf"
+    # shellcheck source=/dev/null
     [ -f "$conf" ] && source "$conf"
     local vm_name="${VM_NAME:-win11-dragonforge}"
+    local gpu_pci="${GPU_PCI:-0000:01:00.0}"
+
+    print_banner
+    header "Starting VM"
+
+    # Pre-flight checks
+    if ! lsmod | grep -q "^vfio_pci"; then
+        error "vfio_pci module not loaded"
+        info "Run: sudo modprobe vfio-pci"
+        info "Or reboot after running './dragonforge setup'"
+        exit 1
+    fi
+    success "vfio_pci module loaded"
+
+    # Check if VM is already running
+    local state
+    state=$(sudo virsh domstate "$vm_name" 2>/dev/null || echo "undefined")
+    if [ "$state" = "running" ]; then
+        warn "$vm_name is already running"
+        info "Use './dragonforge vm-viewer' to connect"
+        return 0
+    fi
+
+    # Check if GPU exists at PCI address
+    if [ ! -d "/sys/bus/pci/devices/$gpu_pci" ]; then
+        error "GPU not found at PCI address $gpu_pci"
+        info "Run './dragonforge detect' to find the correct address"
+        exit 1
+    fi
+    success "GPU found at $gpu_pci"
+
+    # GPU temperature check
+    if command -v nvidia-smi &>/dev/null; then
+        local temp
+        temp=$(nvidia-smi --query-gpu=temperature.gpu --format=csv,noheader,nounits 2>/dev/null | head -1)
+        if [ -n "$temp" ] && [ "$temp" -gt 0 ] 2>/dev/null; then
+            local temp_max="${DRAGONFORGE_GPU_TEMP_MAX:-85}"
+            if [ "$temp" -ge "$temp_max" ]; then
+                error "GPU temperature ${temp}°C exceeds safe limit ${temp_max}°C"
+                info "Let the GPU cool down before starting the VM"
+                exit 1
+            fi
+            success "GPU temperature: ${temp}°C (limit: ${temp_max}°C)"
+        fi
+    fi
+
+    # Battery check for laptops
+    local bat_path="/sys/class/power_supply/BAT0"
+    if [ -d "$bat_path" ]; then
+        local ac_status
+        ac_status=$(cat /sys/class/power_supply/AC*/online 2>/dev/null | head -1)
+        if [ "${ac_status:-1}" = "0" ]; then
+            local capacity
+            capacity=$(cat "$bat_path/capacity" 2>/dev/null || echo "unknown")
+            warn "Running on battery (${capacity}%) — GPU passthrough drains battery fast"
+            info "Plug in power for best experience"
+        else
+            success "AC power connected"
+        fi
+    fi
+
+    # Check libvirtd is running
+    if ! systemctl is-active --quiet libvirtd 2>/dev/null; then
+        error "libvirtd is not running"
+        info "Run: sudo systemctl start libvirtd"
+        exit 1
+    fi
+    success "libvirtd is running"
 
     info "Starting $vm_name..."
     sudo virsh start "$vm_name"
     success "$vm_name is running"
+
+    echo ""
     info "Open viewer: ${BOLD}./dragonforge vm-viewer${NC}"
+    info "Stop VM:     ${BOLD}./dragonforge vm-stop${NC}"
+    echo ""
 }
 
 # ── VM Stop ─────────────────────────────────────────────────────────────────
 
 cmd_vm_stop() {
     local conf="$SCRIPT_DIR/config/dragonforge.conf"
+    # shellcheck source=/dev/null
     [ -f "$conf" ] && source "$conf"
     local vm_name="${VM_NAME:-win11-dragonforge}"
+    local gpu_pci="${GPU_PCI:-0000:01:00.0}"
+
+    # Check if VM is actually running
+    local state
+    state=$(sudo virsh domstate "$vm_name" 2>/dev/null || echo "undefined")
+    if [ "$state" != "running" ]; then
+        info "$vm_name is not running (state: $state)"
+        return 0
+    fi
 
     info "Shutting down $vm_name..."
     sudo virsh shutdown "$vm_name"
-    info "Waiting for graceful shutdown (30s timeout)..."
+    info "Waiting for graceful shutdown (60s timeout)..."
 
     local i=0
-    while [ $i -lt 30 ]; do
+    while [ "$i" -lt 60 ]; do
         if ! sudo virsh domstate "$vm_name" 2>/dev/null | grep -q "running"; then
             success "$vm_name has shut down"
+
+            # Verify GPU returned to host
+            sleep 3
+            local driver
+            driver=$(basename "$(readlink "/sys/bus/pci/devices/$gpu_pci/driver" 2>/dev/null)" 2>/dev/null)
+            if [ -n "$driver" ] && [ "$driver" != "vfio-pci" ]; then
+                success "GPU returned to host ($driver)"
+            elif [ "$driver" = "vfio-pci" ]; then
+                warn "GPU still on vfio-pci — hook release may have failed"
+                info "Run: sudo ./dragonforge gpu-reset"
+            else
+                warn "GPU has no driver — may need PCI rescan"
+                info "Run: sudo echo 1 > /sys/bus/pci/rescan"
+            fi
             return 0
         fi
         sleep 1
         i=$((i + 1))
     done
 
-    warn "VM did not shut down gracefully. Use './dragonforge vm-kill' to force."
+    warn "VM did not shut down gracefully after 60s."
+    info "Use './dragonforge vm-kill' to force stop."
 }
 
 # ── VM Kill ─────────────────────────────────────────────────────────────────
 
 cmd_vm_kill() {
     local conf="$SCRIPT_DIR/config/dragonforge.conf"
+    # shellcheck source=/dev/null
     [ -f "$conf" ] && source "$conf"
     local vm_name="${VM_NAME:-win11-dragonforge}"
+
+    # Check if running first
+    local state
+    state=$(sudo virsh domstate "$vm_name" 2>/dev/null || echo "undefined")
+    if [ "$state" != "running" ] && [ "$state" != "paused" ]; then
+        info "$vm_name is not running (state: $state)"
+        return 0
+    fi
 
     warn "Force stopping $vm_name..."
     sudo virsh destroy "$vm_name"
     success "$vm_name forcefully stopped"
+    info "GPU should return to host within a few seconds"
 }
 
 # ── VM Viewer ───────────────────────────────────────────────────────────────
 
 cmd_vm_viewer() {
     local conf="$SCRIPT_DIR/config/dragonforge.conf"
+    # shellcheck source=/dev/null
     [ -f "$conf" ] && source "$conf"
     local vm_name="${VM_NAME:-win11-dragonforge}"
+
+    # Check if VM is running
+    local state
+    state=$(sudo virsh domstate "$vm_name" 2>/dev/null || echo "undefined")
+    if [ "$state" != "running" ]; then
+        error "$vm_name is not running (state: $state)"
+        info "Start it first: ./dragonforge vm-start"
+        exit 1
+    fi
 
     if ! command -v virt-viewer &>/dev/null; then
         error "virt-viewer not installed"
@@ -665,6 +817,83 @@ cmd_vm_viewer() {
     virt-viewer "$vm_name" &
     disown
     success "Viewer opened"
+}
+
+# ── GPU Reset (emergency) ───────────────────────────────────────────────────
+
+cmd_gpu_reset() {
+    print_banner
+    header "Emergency GPU Reset"
+
+    local conf="$SCRIPT_DIR/config/dragonforge.conf"
+    # shellcheck source=/dev/null
+    [ -f "$conf" ] && source "$conf"
+    local gpu_pci="${GPU_PCI:-0000:01:00.0}"
+    local gpu_audio="${GPU_AUDIO:-0000:01:00.1}"
+
+    if [ "$EUID" -ne 0 ]; then
+        error "GPU reset must be run as root (use sudo)"
+        exit 1
+    fi
+
+    for dev in $gpu_pci $gpu_audio; do
+        local driver
+        driver=$(basename "$(readlink "/sys/bus/pci/devices/$dev/driver" 2>/dev/null)" 2>/dev/null)
+        info "$dev current driver: ${driver:-none}"
+
+        # Unbind from current driver
+        if [ -n "$driver" ]; then
+            echo "$dev" > "/sys/bus/pci/devices/$dev/driver/unbind" 2>/dev/null || true
+            sleep 0.5
+        fi
+
+        # Clear override
+        echo "" > "/sys/bus/pci/devices/$dev/driver_override" 2>/dev/null || true
+    done
+
+    # Rescan PCI bus
+    info "Rescanning PCI bus..."
+    echo 1 > /sys/bus/pci/rescan
+    sleep 2
+
+    # Reload nvidia
+    for mod in nvidia nvidia_modeset nvidia_uvm nvidia_drm; do
+        modprobe "$mod" 2>/dev/null || true
+    done
+
+    # Verify
+    for dev in $gpu_pci $gpu_audio; do
+        local driver
+        driver=$(basename "$(readlink "/sys/bus/pci/devices/$dev/driver" 2>/dev/null)" 2>/dev/null)
+        if [ -n "$driver" ] && [ "$driver" != "vfio-pci" ]; then
+            success "$dev → $driver"
+        else
+            warn "$dev → ${driver:-no driver}"
+        fi
+    done
+
+    echo ""
+}
+
+# ── Logs ────────────────────────────────────────────────────────────────────
+
+cmd_logs() {
+    local log_file="/var/log/dragonforge.log"
+    local lines="${2:-50}"
+
+    if [ -f "$log_file" ]; then
+        info "Last $lines lines from $log_file:"
+        echo ""
+        tail -n "$lines" "$log_file"
+    else
+        info "No log file yet. Logs are created when the VM starts/stops."
+    fi
+
+    echo ""
+    info "System journal entries:"
+    echo ""
+    journalctl -t DragonForge --no-pager -n "$lines" 2>/dev/null || info "No journal entries found"
+    echo ""
 }
 
 # ── Uninstall ───────────────────────────────────────────────────────────────
@@ -700,6 +929,8 @@ case "${1:-help}" in
     vm-stop)    cmd_vm_stop ;;
     vm-kill)    cmd_vm_kill ;;
     vm-viewer)  cmd_vm_viewer ;;
+    gpu-reset)  cmd_gpu_reset ;;
+    logs)       cmd_logs ;;
     uninstall)  cmd_uninstall ;;
     help|*)
         print_banner
@@ -710,10 +941,12 @@ case "${1:-help}" in
         echo "    setup       Install hook + configure VFIO (requires sudo)"
         echo "    status      Check passthrough state"
         echo "    vm-create   Create Windows 11 VM from config"
-        echo "    vm-start    Start the VM"
+        echo "    vm-start    Start the VM (with pre-flight checks)"
         echo "    vm-stop     Gracefully shut down the VM"
         echo "    vm-kill     Force stop the VM"
         echo "    vm-viewer   Open SPICE viewer"
+        echo "    gpu-reset   Emergency: return GPU to host (requires sudo)"
+        echo "    logs        Show DragonForge log history"
         echo "    uninstall   Remove hook and VFIO config (requires sudo)"
         echo ""
         ;;

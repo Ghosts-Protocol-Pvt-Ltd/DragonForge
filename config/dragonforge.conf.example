@@ -30,3 +30,11 @@ GPU_AUDIO_DEVICE_ID="22be"     # Your GPU audio's device ID
 
 WIN_ISO_PATH="/path/to/Win11.iso"
 VIRTIO_ISO_PATH="/path/to/virtio-win.iso"
+
+# ── Hardware Health ─────────────────────────────────────────────────────────
+
+# Hook timeout in seconds (self-terminates to prevent libvirtd hangs)
+DRAGONFORGE_HOOK_TIMEOUT="30"
+
+# GPU temperature limit (°C) — refuse passthrough if GPU is too hot
+DRAGONFORGE_GPU_TEMP_MAX="85"
