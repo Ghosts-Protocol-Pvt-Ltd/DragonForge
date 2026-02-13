@@ -47,6 +47,169 @@ warn()    { echo -e "  ${YELLOW}⚠${NC} $1"; }
 error()   { echo -e "  ${RED}✗${NC} $1"; }
 header()  { echo -e "\n  ${BOLD}${CYAN}── $1 ──${NC}\n"; }
 
+# ── Auto-generate Config ───────────────────────────────────────────────────
+
+auto_generate_config() {
+    local conf="$SCRIPT_DIR/config/dragonforge.conf"
+
+    # Already exists — nothing to do
+    if [ -f "$conf" ]; then
+        return 0
+    fi
+
+    header "Auto-generating Config"
+    info "No config found — detecting hardware..."
+
+    # Find first discrete NVIDIA/AMD GPU (VGA/3D controller)
+    local gpu_bdf="" gpu_vendor="" gpu_device=""
+    while IFS= read -r line; do
+        local bdf desc
+        bdf=$(echo "$line" | awk '{print $1}')
+        desc=$(echo "$line" | cut -d' ' -f2-)
+
+        if echo "$desc" | grep -qiE "nvidia|radeon|amd.*navi|amd.*vega"; then
+            if echo "$desc" | grep -qiE "VGA|3D|Display"; then
+                gpu_bdf="$bdf"
+                # Normalize to full domain format
+                if [[ ! "$gpu_bdf" =~ ^[0-9a-fA-F]{4}: ]]; then
+                    gpu_bdf="0000:$gpu_bdf"
+                fi
+                gpu_vendor=$(cat "/sys/bus/pci/devices/$gpu_bdf/vendor" 2>/dev/null | sed 's/^0x//')
+                gpu_device=$(cat "/sys/bus/pci/devices/$gpu_bdf/device" 2>/dev/null | sed 's/^0x//')
+                break
+            fi
+        fi
+    done < <(lspci -Dnn 2>/dev/null | grep -iE "VGA|3D|Display" || true)
+
+    if [ -z "$gpu_bdf" ]; then
+        error "No discrete NVIDIA/AMD GPU found"
+        info "Create config/dragonforge.conf manually from the example"
+        return 1
+    fi
+
+    success "Found GPU: $gpu_bdf [$gpu_vendor:$gpu_device]"
+
+    # Find matching audio device (same bus, function .1)
+    local bus_prefix="${gpu_bdf%.*}"
+    local gpu_audio_bdf="${bus_prefix}.1"
+    local audio_vendor="" audio_device=""
+    if [ -d "/sys/bus/pci/devices/$gpu_audio_bdf" ]; then
+        audio_vendor=$(cat "/sys/bus/pci/devices/$gpu_audio_bdf/vendor" 2>/dev/null | sed 's/^0x//')
+        audio_device=$(cat "/sys/bus/pci/devices/$gpu_audio_bdf/device" 2>/dev/null | sed 's/^0x//')
+        success "Found GPU Audio: $gpu_audio_bdf [$audio_vendor:$audio_device]"
+    else
+        gpu_audio_bdf=""
+        warn "No GPU audio device found at ${bus_prefix}.1 — edit config manually"
+    fi
+
+    # Detect total RAM, allocate half for VM (rounded to nearest GB, capped at 16G min 4G)
+    local total_ram_kb
+    total_ram_kb=$(awk '/MemTotal/{print $2}' /proc/meminfo)
+    local vm_ram_mb=$(( (total_ram_kb / 2 / 1024 / 1024) * 1024 ))  # round down to nearest GB
+    if [ "$vm_ram_mb" -gt 16384 ]; then vm_ram_mb=16384; fi
+    if [ "$vm_ram_mb" -lt 4096 ]; then vm_ram_mb=4096; fi
+
+    # Detect CPU threads, allocate half for VM (min 2)
+    local total_threads
+    total_threads=$(nproc)
+    local vm_cpus=$(( total_threads / 2 ))
+    if [ "$vm_cpus" -lt 2 ]; then vm_cpus=2; fi
+
+    # Find Windows ISO
+    local win_iso=""
+    for search_dir in "$HOME/Downloads" "$HOME" "/tmp"; do
+        local found
+        found=$(find "$search_dir" -maxdepth 2 -iname "Win11*.iso" -o -iname "Win10*.iso" 2>/dev/null | head -1)
+        if [ -n "$found" ]; then
+            win_iso="$found"
+            break
+        fi
+    done
+
+    # Find VirtIO ISO
+    local virtio_iso=""
+    for search_dir in "$HOME/Downloads" "$HOME" "/tmp"; do
+        local found
+        found=$(find "$search_dir" -maxdepth 2 -iname "virtio-win*.iso" 2>/dev/null | head -1)
+        if [ -n "$found" ]; then
+            virtio_iso="$found"
+            break
+        fi
+    done
+
+    # Write config
+    mkdir -p "$SCRIPT_DIR/config"
+    cat > "$conf" <<CONFEOF
+# ============================================================================
+# DragonForge Configuration — Auto-generated $(date +%Y-%m-%d)
+# ============================================================================
+# Edit these values if anything looks wrong.
+# Run 'dragonforge detect' to see full hardware details.
+# ============================================================================
+
+# ── VM Settings ─────────────────────────────────────────────────────────────
+
+VM_NAME="win11-dragonforge"
+VM_RAM_MB="$vm_ram_mb"
+VM_CPUS="$vm_cpus"
+VM_DISK_SIZE="128G"
+VM_DISK_PATH="/var/lib/libvirt/images/win11-dragonforge.qcow2"
+
+# ── GPU Settings ────────────────────────────────────────────────────────────
+
+GPU_PCI="$gpu_bdf"
+GPU_AUDIO="${gpu_audio_bdf:-EDIT_ME}"
+
+GPU_VENDOR_ID="$gpu_vendor"
+GPU_DEVICE_ID="$gpu_device"
+GPU_AUDIO_VENDOR_ID="${audio_vendor:-$gpu_vendor}"
+GPU_AUDIO_DEVICE_ID="${audio_device:-EDIT_ME}"
+
+# ── ISO Paths ───────────────────────────────────────────────────────────────
+
+WIN_ISO_PATH="${win_iso:-/path/to/Win11.iso}"
+VIRTIO_ISO_PATH="${virtio_iso:-/path/to/virtio-win.iso}"
+
+# ── Hardware Health ─────────────────────────────────────────────────────────
+
+DRAGONFORGE_HOOK_TIMEOUT="30"
+DRAGONFORGE_GPU_TEMP_MAX="85"
+CONFEOF
+
+    success "Config written to config/dragonforge.conf"
+
+    # Report what was detected vs what needs manual editing
+    if [ -n "$win_iso" ]; then
+        success "Windows ISO: $win_iso"
+    else
+        warn "No Windows ISO found — edit WIN_ISO_PATH in config"
+    fi
+    if [ -n "$virtio_iso" ]; then
+        success "VirtIO ISO: $virtio_iso"
+    else
+        warn "No VirtIO ISO found — edit VIRTIO_ISO_PATH in config"
+    fi
+
+    echo ""
+    return 0
+}
+
+# ── Load Config Helper ─────────────────────────────────────────────────────
+
+load_config() {
+    local conf="$SCRIPT_DIR/config/dragonforge.conf"
+
+    # Auto-generate if missing
+    if [ ! -f "$conf" ]; then
+        auto_generate_config || {
+            error "Cannot proceed without config"
+            exit 1
+        }
+    fi
+
+    source "$conf"
+}
+
 # ── Detect ──────────────────────────────────────────────────────────────────
 
 cmd_detect() {
@@ -180,10 +343,9 @@ cmd_detect() {
 
     # Summary
     header "Next Steps"
-    info "1. Note the GPU PCI address and vendor:device IDs above"
-    info "2. Edit ${BOLD}config/dragonforge.conf${NC} with your values"
-    info "3. Run ${BOLD}./dragonforge setup${NC} to install the hook"
-    info "4. Run ${BOLD}./dragonforge vm-create${NC} to create the VM"
+    info "Run ${BOLD}dragonforge setup${NC} — config is auto-generated from detected hardware"
+    info "Then ${BOLD}dragonforge create${NC} to create the VM"
+    info "Edit ${BOLD}config/dragonforge.conf${NC} if you need to tweak anything"
     echo ""
 }
 
@@ -193,14 +355,8 @@ cmd_status() {
     print_banner
     header "DragonForge Status"
 
-    # Load config
-    local conf="$SCRIPT_DIR/config/dragonforge.conf"
-    if [ -f "$conf" ]; then
-        source "$conf"
-        success "Config loaded"
-    else
-        warn "No config found — using defaults"
-    fi
+    # Load config (auto-generates if missing)
+    load_config
 
     local vm_name="${VM_NAME:-win11-dragonforge}"
     local gpu_pci="${GPU_PCI:-0000:01:00.0}"
@@ -270,14 +426,8 @@ cmd_setup() {
         exit 1
     fi
 
-    # Load config
-    local conf="$SCRIPT_DIR/config/dragonforge.conf"
-    if [ ! -f "$conf" ]; then
-        error "Config not found: $conf"
-        info "Run './dragonforge detect' first, then edit config/dragonforge.conf"
-        exit 1
-    fi
-    source "$conf"
+    # Load config (auto-generates if missing)
+    load_config
 
     # Validate config
     if [ -z "${GPU_PCI:-}" ] || [ -z "${GPU_AUDIO:-}" ] || [ -z "${GPU_VENDOR_ID:-}" ] || [ -z "${GPU_DEVICE_ID:-}" ]; then
@@ -384,12 +534,8 @@ cmd_vm_create() {
     print_banner
     header "Creating VM"
 
-    local conf="$SCRIPT_DIR/config/dragonforge.conf"
-    if [ ! -f "$conf" ]; then
-        error "Config not found. Run './dragonforge detect' first."
-        exit 1
-    fi
-    source "$conf"
+    # Load config (auto-generates if missing)
+    load_config
 
     local vm_name="${VM_NAME:-win11-dragonforge}"
     local vm_ram="${VM_RAM_MB:-16384}"
@@ -647,9 +793,7 @@ XMLEOF
 # ── VM Start ────────────────────────────────────────────────────────────────
 
 cmd_vm_start() {
-    local conf="$SCRIPT_DIR/config/dragonforge.conf"
-    # shellcheck source=/dev/null
-    [ -f "$conf" ] && source "$conf"
+    load_config
     local vm_name="${VM_NAME:-win11-dragonforge}"
     local gpu_pci="${GPU_PCI:-0000:01:00.0}"
 
@@ -733,9 +877,7 @@ cmd_vm_start() {
 # ── VM Stop ─────────────────────────────────────────────────────────────────
 
 cmd_vm_stop() {
-    local conf="$SCRIPT_DIR/config/dragonforge.conf"
-    # shellcheck source=/dev/null
-    [ -f "$conf" ] && source "$conf"
+    load_config
     local vm_name="${VM_NAME:-win11-dragonforge}"
     local gpu_pci="${GPU_PCI:-0000:01:00.0}"
 
@@ -782,9 +924,7 @@ cmd_vm_stop() {
 # ── VM Kill ─────────────────────────────────────────────────────────────────
 
 cmd_vm_kill() {
-    local conf="$SCRIPT_DIR/config/dragonforge.conf"
-    # shellcheck source=/dev/null
-    [ -f "$conf" ] && source "$conf"
+    load_config
     local vm_name="${VM_NAME:-win11-dragonforge}"
 
     # Check if running first
@@ -804,9 +944,7 @@ cmd_vm_kill() {
 # ── VM Viewer ───────────────────────────────────────────────────────────────
 
 cmd_vm_viewer() {
-    local conf="$SCRIPT_DIR/config/dragonforge.conf"
-    # shellcheck source=/dev/null
-    [ -f "$conf" ] && source "$conf"
+    load_config
     local vm_name="${VM_NAME:-win11-dragonforge}"
 
     # Check if VM is running
@@ -836,9 +974,7 @@ cmd_gpu_reset() {
     print_banner
     header "Emergency GPU Reset"
 
-    local conf="$SCRIPT_DIR/config/dragonforge.conf"
-    # shellcheck source=/dev/null
-    [ -f "$conf" ] && source "$conf"
+    load_config
     local gpu_pci="${GPU_PCI:-0000:01:00.0}"
     local gpu_audio="${GPU_AUDIO:-0000:01:00.1}"
 
