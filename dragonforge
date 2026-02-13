@@ -20,6 +20,7 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
+VERSION="1.1.0"
 
 # ── Colors ──────────────────────────────────────────────────────────────────
 
@@ -35,7 +36,7 @@ NC='\033[0m'
 print_banner() {
     echo -e "${CYAN}"
     echo "  ╔══════════════════════════════════════════════╗"
-    echo "  ║            🐉 DragonForge                    ║"
+    echo "  ║            🐉 DragonForge v${VERSION}              ║"
     echo "  ║      GPU Passthrough Toolkit                 ║"
     echo "  ╚══════════════════════════════════════════════╝"
     echo -e "${NC}"
@@ -487,7 +488,7 @@ EOF
     # Ensure required packages
     header "Checking Dependencies"
     local deps_ok=1
-    for cmd in qemu-system-x86_64 virsh virt-viewer swtpm; do
+    for cmd in qemu-system-x86_64 virsh virt-viewer swtpm swtpm_setup; do
         if command -v "$cmd" &>/dev/null; then
             success "$cmd: found"
         else
@@ -499,9 +500,9 @@ EOF
     if [ "$deps_ok" -eq 0 ]; then
         echo ""
         info "Install missing packages:"
-        info "  Fedora:  sudo dnf install qemu-kvm libvirt virt-manager virt-viewer swtpm"
-        info "  Arch:    sudo pacman -S qemu-full libvirt virt-manager virt-viewer swtpm"
-        info "  Ubuntu:  sudo apt install qemu-kvm libvirt-daemon virt-manager virt-viewer swtpm"
+        info "  Fedora:  sudo dnf install qemu-kvm libvirt virt-manager virt-viewer swtpm swtpm-tools edk2-ovmf"
+        info "  Arch:    sudo pacman -S qemu-full libvirt virt-manager virt-viewer swtpm edk2-ovmf"
+        info "  Ubuntu:  sudo apt install qemu-kvm libvirt-daemon virt-manager virt-viewer swtpm swtpm-tools ovmf"
     fi
 
     # Create symlink so 'dragonforge' works from anywhere
@@ -566,44 +567,64 @@ cmd_vm_create() {
         warn "Disk already exists: $disk_path"
     fi
 
-    # Copy OVMF VARS for secure boot (always fresh — stale VARS breaks TPM/SecureBoot)
+    # Check swtpm (required for Windows 11 TPM 2.0)
+    if ! command -v swtpm &>/dev/null; then
+        error "swtpm not found — required for Windows 11 TPM 2.0"
+        info "  Fedora:  sudo dnf install swtpm swtpm-tools"
+        info "  Arch:    sudo pacman -S swtpm"
+        info "  Ubuntu:  sudo apt install swtpm swtpm-tools"
+        exit 1
+    fi
+    success "swtpm: found"
+
+    # Find OVMF firmware — CODE and VARS must be the same size variant.
+    # Windows 11 requires Secure Boot with Microsoft keys pre-enrolled.
+    # Prefer 4M SecureBoot (modern Fedora 38+), fall back to 2M, then non-SecureBoot.
+    local ovmf_code="" ovmf_src=""
     local ovmf_vars="/var/lib/libvirt/images/${vm_name}_VARS.fd"
-    local ovmf_src=""
-    for candidate in \
-        /usr/share/edk2/ovmf/OVMF_VARS.secboot.fd \
-        /usr/share/OVMF/OVMF_VARS.ms.fd \
-        /usr/share/OVMF/OVMF_VARS.fd \
-        /usr/share/edk2/ovmf/OVMF_VARS.fd; do
-        if [ -f "$candidate" ]; then
-            ovmf_src="$candidate"
+    local -a firmware_pairs=(
+        # Fedora 4M SecureBoot (preferred for Win11)
+        "/usr/share/edk2/ovmf/OVMF_CODE_4M.secboot.fd:/usr/share/edk2/ovmf/OVMF_VARS_4M.secboot.fd"
+        # Fedora 2M SecureBoot
+        "/usr/share/edk2/ovmf/OVMF_CODE.secboot.fd:/usr/share/edk2/ovmf/OVMF_VARS.secboot.fd"
+        # Ubuntu/Debian 4M SecureBoot
+        "/usr/share/OVMF/OVMF_CODE_4M.secboot.fd:/usr/share/OVMF/OVMF_VARS_4M.secboot.fd"
+        "/usr/share/OVMF/OVMF_CODE_4M.ms.fd:/usr/share/OVMF/OVMF_VARS_4M.ms.fd"
+        # Ubuntu/Debian 2M SecureBoot
+        "/usr/share/OVMF/OVMF_CODE.secboot.fd:/usr/share/OVMF/OVMF_VARS.secboot.fd"
+        "/usr/share/OVMF/OVMF_CODE.ms.fd:/usr/share/OVMF/OVMF_VARS.ms.fd"
+        # Fallback non-SecureBoot (Windows 11 will likely reject this)
+        "/usr/share/edk2/ovmf/OVMF_CODE_4M.fd:/usr/share/edk2/ovmf/OVMF_VARS_4M.fd"
+        "/usr/share/edk2/ovmf/OVMF_CODE.fd:/usr/share/edk2/ovmf/OVMF_VARS.fd"
+        "/usr/share/OVMF/OVMF_CODE.fd:/usr/share/OVMF/OVMF_VARS.fd"
+    )
+    for pair in "${firmware_pairs[@]}"; do
+        local code="${pair%%:*}"
+        local vars="${pair##*:}"
+        if [ -f "$code" ] && [ -f "$vars" ]; then
+            ovmf_code="$code"
+            ovmf_src="$vars"
             break
         fi
     done
-    if [ -n "$ovmf_src" ]; then
-        sudo cp "$ovmf_src" "$ovmf_vars"
-        success "OVMF VARS: $ovmf_vars (fresh copy)"
-    else
-        error "No OVMF VARS template found. Install edk2-ovmf."
+
+    if [ -z "$ovmf_code" ] || [ -z "$ovmf_src" ]; then
+        error "No OVMF firmware found. Install edk2-ovmf."
+        info "  Fedora:  sudo dnf install edk2-ovmf"
+        info "  Arch:    sudo pacman -S edk2-ovmf"
+        info "  Ubuntu:  sudo apt install ovmf"
         exit 1
     fi
 
-    # Find OVMF CODE
-    local ovmf_code=""
-    for candidate in \
-        /usr/share/edk2/ovmf/OVMF_CODE.secboot.fd \
-        /usr/share/OVMF/OVMF_CODE.secboot.fd \
-        /usr/share/OVMF/OVMF_CODE.ms.fd \
-        /usr/share/edk2/ovmf/OVMF_CODE.fd \
-        /usr/share/OVMF/OVMF_CODE.fd; do
-        if [ -f "$candidate" ]; then
-            ovmf_code="$candidate"
-            break
-        fi
-    done
+    success "OVMF CODE: $ovmf_code"
+    sudo cp "$ovmf_src" "$ovmf_vars"
+    success "OVMF VARS: $ovmf_src → $ovmf_vars"
 
-    if [ -z "$ovmf_code" ]; then
-        error "No OVMF CODE found. Install edk2-ovmf."
-        exit 1
+    if [[ "$ovmf_src" == *"secboot"* ]] || [[ "$ovmf_src" == *".ms."* ]]; then
+        success "Secure Boot keys: pre-enrolled (Windows 11 compatible)"
+    else
+        warn "VARS template has no pre-enrolled Secure Boot keys"
+        warn "Windows 11 may refuse to install — try installing edk2-ovmf with SecureBoot support"
     fi
 
     # Helper to parse PCI address (domain:bus:slot.function) into XML
@@ -635,6 +656,16 @@ PCIEOF
 
     # Generate VM XML
     info "Generating VM definition..."
+
+    # Compute CPU topology — cores × threads must equal vm_cpus
+    local topo_cores topo_threads
+    if [ "$((vm_cpus % 2))" -eq 0 ] && [ "$vm_cpus" -gt 1 ]; then
+        topo_cores=$((vm_cpus / 2))
+        topo_threads=2
+    else
+        topo_cores=$vm_cpus
+        topo_threads=1
+    fi
 
     local xml_path
     xml_path=$(mktemp "/tmp/${vm_name}.XXXXXX.xml")
@@ -679,7 +710,7 @@ PCIEOF
     <smm state='on'/>
   </features>
   <cpu mode='host-passthrough' check='none' migratable='off'>
-    <topology sockets='1' dies='1' clusters='1' cores='$(( vm_cpus > 1 ? vm_cpus / 2 : 1 ))' threads='$(( vm_cpus > 1 ? 2 : 1 ))'/>
+    <topology sockets='1' dies='1' clusters='1' cores='$topo_cores' threads='$topo_threads'/>
   </cpu>
   <clock offset='localtime'>
     <timer name='rtc' tickpolicy='catchup'/>
@@ -780,18 +811,22 @@ XMLEOF
             sudo virsh destroy "$vm_name" 2>/dev/null || true
             sleep 1
         fi
+
+        # Get old UUID for targeted swtpm cleanup
+        local old_uuid
+        old_uuid=$(sudo virsh domuuid "$vm_name" 2>/dev/null || true)
+
         warn "VM '$vm_name' already defined — undefining (with NVRAM + TPM cleanup)"
         sudo virsh undefine "$vm_name" --nvram --tpm 2>/dev/null || true
-    fi
 
-    # Also nuke any leftover swtpm state (ensures clean TPM on next boot)
-    local swtpm_dir="/var/lib/libvirt/swtpm"
-    if [ -d "$swtpm_dir" ]; then
-        # Find and remove state dirs for this VM name (match by path contents)
-        for uuid_dir in "$swtpm_dir"/*/; do
-            [ -d "$uuid_dir" ] && sudo rm -rf "$uuid_dir"
-        done
-        info "Cleared swtpm state for fresh TPM"
+        # Clean up leftover swtpm state for THIS VM only (by UUID)
+        if [ -n "$old_uuid" ]; then
+            local swtpm_dir="/var/lib/libvirt/swtpm"
+            if [ -d "$swtpm_dir/$old_uuid" ]; then
+                sudo rm -rf "$swtpm_dir/$old_uuid"
+                info "Cleared swtpm state for $old_uuid"
+            fi
+        fi
     fi
 
     sudo virsh define "$xml_path"
@@ -1082,6 +1117,12 @@ cmd_vm_delete() {
         sleep 2
     fi
 
+    # Get VM UUID for targeted swtpm cleanup before undefining
+    local vm_uuid=""
+    if virsh dominfo "$vm_name" &>/dev/null; then
+        vm_uuid=$(virsh domuuid "$vm_name" 2>/dev/null || true)
+    fi
+
     # Undefine with full cleanup
     if virsh dominfo "$vm_name" &>/dev/null; then
         virsh undefine "$vm_name" --nvram --tpm 2>/dev/null || true
@@ -1102,18 +1143,12 @@ cmd_vm_delete() {
         success "NVRAM removed: $ovmf_vars"
     fi
 
-    # Remove swtpm state
-    local swtpm_dir="/var/lib/libvirt/swtpm"
-    if [ -d "$swtpm_dir" ]; then
-        local cleaned=0
-        for uuid_dir in "$swtpm_dir"/*/; do
-            if [ -d "$uuid_dir" ]; then
-                rm -rf "$uuid_dir"
-                cleaned=1
-            fi
-        done
-        if [ "$cleaned" -eq 1 ]; then
-            success "TPM state cleared"
+    # Remove swtpm state for THIS VM only
+    if [ -n "$vm_uuid" ]; then
+        local swtpm_dir="/var/lib/libvirt/swtpm"
+        if [ -d "$swtpm_dir/$vm_uuid" ]; then
+            rm -rf "$swtpm_dir/$vm_uuid"
+            success "TPM state cleared ($vm_uuid)"
         fi
     fi
 
@@ -1166,6 +1201,7 @@ case "$CMD" in
     vmdelete|delete)        cmd_vm_delete ;;
     logs|log)               cmd_logs "${2:-}" ;;
     uninstall|remove)       cmd_uninstall ;;
+    version|v)              echo "DragonForge $VERSION" ;;
     help|*)
         print_banner
         echo "  Usage: dragonforge <command>"
@@ -1183,6 +1219,7 @@ case "$CMD" in
         echo "    delete      Delete VM (disk, NVRAM, TPM — keeps ISOs)"
         echo "    logs        Show DragonForge log history"
         echo "    uninstall   Remove hook and VFIO config (requires sudo)"
+        echo "    version     Show version"
         echo ""
         echo "  Aliases: vm-start, vmstart, start all work. Hyphens are optional."
         echo ""
