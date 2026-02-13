@@ -1,0 +1,18 @@
+# DragonForge user config (contains local paths and PCI addresses)
+config/dragonforge.conf
+
+# OS/editor
+.DS_Store
+*.swp
+*.swo
+*~
+.vscode/
+
+# VM artifacts (don't commit disk images or ISOs)
+*.qcow2
+*.iso
+*.fd
+*.xml
+
+# Logs
+*.log

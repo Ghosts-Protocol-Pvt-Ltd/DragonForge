@@ -1,0 +1,32 @@
+# ============================================================================
+# DragonForge Configuration — Example
+# ============================================================================
+# Copy this to dragonforge.conf and edit with your system's values.
+# Run './dragonforge detect' to find the correct PCI addresses and IDs.
+# ============================================================================
+
+# ── VM Settings ─────────────────────────────────────────────────────────────
+
+VM_NAME="win11-dragonforge"
+VM_RAM_MB="16384"         # 16 GB — adjust based on your total RAM
+VM_CPUS="8"               # vCPUs (cores × threads)
+VM_DISK_SIZE="128G"       # VM disk size
+VM_DISK_PATH="/var/lib/libvirt/images/win11-dragonforge.qcow2"
+
+# ── GPU Settings ────────────────────────────────────────────────────────────
+# PCI addresses in domain:bus:slot.function format
+# Find with: lspci -nn | grep -iE "nvidia|amd"
+
+GPU_PCI="0000:01:00.0"        # Your GPU's PCI address
+GPU_AUDIO="0000:01:00.1"      # Your GPU's HDMI audio PCI address
+
+# Vendor:Device IDs (hex, no 0x prefix)
+GPU_VENDOR_ID="10de"           # 10de = NVIDIA, 1002 = AMD
+GPU_DEVICE_ID="28a0"           # Your GPU's device ID
+GPU_AUDIO_VENDOR_ID="10de"
+GPU_AUDIO_DEVICE_ID="22be"     # Your GPU audio's device ID
+
+# ── ISO Paths ───────────────────────────────────────────────────────────────
+
+WIN_ISO_PATH="/path/to/Win11.iso"
+VIRTIO_ISO_PATH="/path/to/virtio-win.iso"

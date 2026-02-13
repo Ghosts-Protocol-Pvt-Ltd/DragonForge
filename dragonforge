@@ -1,0 +1,720 @@
+#!/bin/bash
+# ============================================================================
+# DragonForge — System Detection & Setup
+# ============================================================================
+# Detects IOMMU groups, GPU devices, and validates system readiness for
+# GPU passthrough. Can also install the hook and configure VFIO.
+#
+# Usage:
+#   ./dragonforge detect     — Detect GPU, IOMMU groups, system info
+#   ./dragonforge setup      — Install hook + configure VFIO modules
+#   ./dragonforge status     — Check current passthrough state
+#   ./dragonforge vm-create  — Create the Windows 11 VM
+#   ./dragonforge vm-start   — Start the VM
+#   ./dragonforge vm-stop    — Gracefully stop the VM
+#   ./dragonforge vm-kill    — Force stop the VM
+#   ./dragonforge vm-viewer  — Open SPICE viewer
+#   ./dragonforge uninstall  — Remove hook and VFIO config
+# ============================================================================
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+# ── Colors ──────────────────────────────────────────────────────────────────
+
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
+CYAN='\033[0;36m'
+BOLD='\033[1m'
+DIM='\033[2m'
+NC='\033[0m'
+
+print_banner() {
+    echo -e "${CYAN}"
+    echo "  ╔══════════════════════════════════════════════╗"
+    echo "  ║            🐉 DragonForge                    ║"
+    echo "  ║      GPU Passthrough Toolkit                 ║"
+    echo "  ╚══════════════════════════════════════════════╝"
+    echo -e "${NC}"
+}
+
+info()    { echo -e "  ${BLUE}▸${NC} $1"; }
+success() { echo -e "  ${GREEN}✓${NC} $1"; }
+warn()    { echo -e "  ${YELLOW}⚠${NC} $1"; }
+error()   { echo -e "  ${RED}✗${NC} $1"; }
+header()  { echo -e "\n  ${BOLD}${CYAN}── $1 ──${NC}\n"; }
+
+# ── Detect ──────────────────────────────────────────────────────────────────
+
+cmd_detect() {
+    print_banner
+    header "System Information"
+
+    # OS
+    if [ -f /etc/os-release ]; then
+        source /etc/os-release
+        info "OS: ${BOLD}$NAME $VERSION${NC}"
+    fi
+
+    # Kernel
+    info "Kernel: ${BOLD}$(uname -r)${NC}"
+
+    # CPU
+    local cpu_model
+    cpu_model=$(grep -m1 "model name" /proc/cpuinfo | cut -d: -f2 | xargs)
+    info "CPU: ${BOLD}$cpu_model${NC}"
+
+    # RAM
+    local total_ram
+    total_ram=$(free -h | awk '/Mem:/{print $2}')
+    info "RAM: ${BOLD}$total_ram${NC}"
+
+    # QEMU
+    if command -v qemu-system-x86_64 &>/dev/null; then
+        local qemu_ver
+        qemu_ver=$(qemu-system-x86_64 --version | head -1 | grep -oP '\d+\.\d+(\.\d+)?')
+        success "QEMU: $qemu_ver"
+    else
+        error "QEMU not found"
+    fi
+
+    # Libvirt
+    if command -v virsh &>/dev/null; then
+        local virsh_ver
+        virsh_ver=$(virsh --version)
+        success "Libvirt: $virsh_ver"
+    else
+        error "Libvirt not found"
+    fi
+
+    # virt-viewer
+    if command -v virt-viewer &>/dev/null; then
+        success "virt-viewer: installed"
+    else
+        warn "virt-viewer: not found (install for SPICE display)"
+    fi
+
+    # IOMMU
+    header "IOMMU Status"
+
+    if dmesg 2>/dev/null | grep -qi "IOMMU enabled\|DMAR:.*IOMMU\|Adding to iommu group"; then
+        success "IOMMU is enabled"
+    elif [ -d /sys/class/iommu ] && [ "$(ls /sys/class/iommu 2>/dev/null)" ]; then
+        success "IOMMU is enabled"
+    else
+        error "IOMMU does not appear to be enabled"
+        info "Add 'intel_iommu=on iommu=pt' (Intel) or 'amd_iommu=on iommu=pt' (AMD) to kernel params"
+    fi
+
+    # VFIO modules
+    header "VFIO Modules"
+
+    for mod in vfio vfio_pci vfio_iommu_type1; do
+        if lsmod | grep -q "^${mod//-/_}"; then
+            success "$mod: loaded"
+        else
+            warn "$mod: not loaded"
+        fi
+    done
+
+    # GPU detection
+    header "GPU Devices"
+
+    echo -e "  ${DIM}Scanning for NVIDIA/AMD discrete GPUs...${NC}"
+    echo ""
+
+    local gpu_found=0
+    while IFS= read -r line; do
+        local bdf vendor_id device_id desc
+        bdf=$(echo "$line" | awk '{print $1}')
+        desc=$(echo "$line" | cut -d' ' -f2-)
+
+        if echo "$desc" | grep -qiE "nvidia|radeon|amd.*navi|amd.*vega"; then
+            vendor_id=$(cat "/sys/bus/pci/devices/0000:$bdf/vendor" 2>/dev/null | sed 's/^0x//')
+            device_id=$(cat "/sys/bus/pci/devices/0000:$bdf/device" 2>/dev/null | sed 's/^0x//')
+
+            echo -e "  ${GREEN}►${NC} ${BOLD}$bdf${NC}"
+            echo -e "    $desc"
+            echo -e "    ${DIM}Vendor:Device = $vendor_id:$device_id${NC}"
+
+            # IOMMU group
+            local iommu_group
+            iommu_group=$(basename "$(readlink "/sys/bus/pci/devices/0000:$bdf/iommu_group" 2>/dev/null)" 2>/dev/null)
+            if [ -n "$iommu_group" ]; then
+                echo -e "    ${DIM}IOMMU Group: $iommu_group${NC}"
+
+                # List other devices in same group
+                local group_members
+                group_members=$(ls "/sys/kernel/iommu_groups/$iommu_group/devices/" 2>/dev/null | tr '\n' ' ')
+                echo -e "    ${DIM}Group members: $group_members${NC}"
+            fi
+
+            # Current driver
+            local driver
+            driver=$(basename "$(readlink "/sys/bus/pci/devices/0000:$bdf/driver" 2>/dev/null)" 2>/dev/null)
+            echo -e "    ${DIM}Driver: ${driver:-none}${NC}"
+
+            echo ""
+            gpu_found=1
+        fi
+    done < <(lspci -nn 2>/dev/null | grep -iE "VGA|3D|Display|Audio" || true)
+
+    if [ "$gpu_found" -eq 0 ]; then
+        warn "No discrete GPU found"
+    fi
+
+    # Summary
+    header "Next Steps"
+    info "1. Note the GPU PCI address and vendor:device IDs above"
+    info "2. Edit ${BOLD}config/dragonforge.conf${NC} with your values"
+    info "3. Run ${BOLD}./dragonforge setup${NC} to install the hook"
+    info "4. Run ${BOLD}./dragonforge vm-create${NC} to create the VM"
+    echo ""
+}
+
+# ── Status ──────────────────────────────────────────────────────────────────
+
+cmd_status() {
+    print_banner
+    header "DragonForge Status"
+
+    # Load config
+    local conf="$SCRIPT_DIR/config/dragonforge.conf"
+    if [ -f "$conf" ]; then
+        source "$conf"
+        success "Config loaded"
+    else
+        warn "No config found — using defaults"
+    fi
+
+    local vm_name="${VM_NAME:-win11-dragonforge}"
+    local gpu_pci="${GPU_PCI:-0000:01:00.0}"
+    local gpu_audio="${GPU_AUDIO:-0000:01:00.1}"
+
+    info "VM Name: ${BOLD}$vm_name${NC}"
+    info "GPU PCI: ${BOLD}$gpu_pci${NC}"
+    info "GPU Audio: ${BOLD}$gpu_audio${NC}"
+
+    # VM state
+    header "VM State"
+    local vm_state
+    vm_state=$(sudo virsh domstate "$vm_name" 2>/dev/null || echo "undefined")
+    if [ "$vm_state" = "running" ]; then
+        success "VM is running"
+    elif [ "$vm_state" = "shut off" ]; then
+        info "VM is shut off"
+    else
+        warn "VM state: $vm_state"
+    fi
+
+    # GPU driver
+    header "GPU Driver State"
+    for dev in $gpu_pci $gpu_audio; do
+        local driver
+        driver=$(basename "$(readlink "/sys/bus/pci/devices/$dev/driver" 2>/dev/null)" 2>/dev/null)
+        if [ "$driver" = "vfio-pci" ]; then
+            info "$dev → ${YELLOW}vfio-pci${NC} (passthrough mode)"
+        elif [ -n "$driver" ]; then
+            info "$dev → ${GREEN}$driver${NC} (host mode)"
+        else
+            warn "$dev → no driver"
+        fi
+    done
+
+    # Hook installed?
+    header "Installation"
+    if [ -x /etc/libvirt/hooks/qemu ]; then
+        success "Hook installed at /etc/libvirt/hooks/qemu"
+    else
+        warn "Hook not installed"
+    fi
+
+    if [ -f /etc/modules-load.d/dragonforge-vfio.conf ]; then
+        success "VFIO modules configured for boot"
+    else
+        warn "VFIO module autoload not configured"
+    fi
+
+    echo ""
+}
+
+# ── Setup ───────────────────────────────────────────────────────────────────
+
+cmd_setup() {
+    print_banner
+    header "Installing DragonForge"
+
+    # Check root
+    if [ "$EUID" -ne 0 ]; then
+        error "Setup must be run as root (use sudo)"
+        exit 1
+    fi
+
+    # Load config
+    local conf="$SCRIPT_DIR/config/dragonforge.conf"
+    if [ ! -f "$conf" ]; then
+        error "Config not found: $conf"
+        info "Run './dragonforge detect' first, then edit config/dragonforge.conf"
+        exit 1
+    fi
+    source "$conf"
+
+    # Validate config
+    if [ -z "${GPU_PCI:-}" ] || [ -z "${GPU_AUDIO:-}" ] || [ -z "${GPU_VENDOR_ID:-}" ] || [ -z "${GPU_DEVICE_ID:-}" ]; then
+        error "Incomplete config. Required: GPU_PCI, GPU_AUDIO, GPU_VENDOR_ID, GPU_DEVICE_ID"
+        exit 1
+    fi
+
+    # Install hook
+    info "Installing libvirt hook..."
+    local hook_src="$SCRIPT_DIR/hooks/qemu"
+    if [ ! -f "$hook_src" ]; then
+        error "Hook script not found: $hook_src"
+        exit 1
+    fi
+
+    mkdir -p /etc/libvirt/hooks
+    cp "$hook_src" /etc/libvirt/hooks/qemu
+    chmod +x /etc/libvirt/hooks/qemu
+    success "Hook installed"
+
+    # Set up environment for hook (so it reads our config)
+    cat > /etc/libvirt/hooks/dragonforge.env <<ENVEOF
+# DragonForge GPU passthrough config — auto-generated
+DRAGONFORGE_VM_NAME=$VM_NAME
+DRAGONFORGE_GPU_PCI=$GPU_PCI
+DRAGONFORGE_GPU_AUDIO=$GPU_AUDIO
+ENVEOF
+    success "Hook environment configured"
+
+    # Patch hook to source env file
+    if ! grep -q "dragonforge.env" /etc/libvirt/hooks/qemu; then
+        sed -i '2i\\n# Source DragonForge config\nif [ -f /etc/libvirt/hooks/dragonforge.env ]; then source /etc/libvirt/hooks/dragonforge.env; fi' /etc/libvirt/hooks/qemu
+    fi
+
+    # VFIO module autoload
+    info "Configuring VFIO modules for boot..."
+    cat > /etc/modules-load.d/dragonforge-vfio.conf <<EOF
+# DragonForge — VFIO modules for GPU passthrough
+vfio-pci
+vfio
+vfio_iommu_type1
+EOF
+    success "VFIO modules will load at boot"
+
+    # VFIO PCI IDs + softdep
+    info "Configuring VFIO PCI device binding..."
+    local audio_vendor_id="${GPU_AUDIO_VENDOR_ID:-$GPU_VENDOR_ID}"
+    local audio_device_id="${GPU_AUDIO_DEVICE_ID:-22be}"
+    cat > /etc/modprobe.d/dragonforge-vfio.conf <<EOF
+# DragonForge — Bind GPU to vfio-pci at boot
+options vfio-pci ids=$GPU_VENDOR_ID:$GPU_DEVICE_ID,$audio_vendor_id:$audio_device_id
+softdep nvidia pre: vfio-pci
+softdep nouveau pre: vfio-pci
+EOF
+    success "VFIO PCI binding configured"
+
+    # Ensure required packages
+    header "Checking Dependencies"
+    local deps_ok=1
+    for cmd in qemu-system-x86_64 virsh virt-viewer swtpm; do
+        if command -v "$cmd" &>/dev/null; then
+            success "$cmd: found"
+        else
+            warn "$cmd: not found"
+            deps_ok=0
+        fi
+    done
+
+    if [ "$deps_ok" -eq 0 ]; then
+        echo ""
+        info "Install missing packages:"
+        info "  Fedora:  sudo dnf install qemu-kvm libvirt virt-manager virt-viewer swtpm"
+        info "  Arch:    sudo pacman -S qemu-full libvirt virt-manager virt-viewer swtpm"
+        info "  Ubuntu:  sudo apt install qemu-kvm libvirt-daemon virt-manager virt-viewer swtpm"
+    fi
+
+    # Restart libvirtd
+    info "Restarting libvirtd..."
+    systemctl restart libvirtd
+    success "libvirtd restarted"
+
+    header "Setup Complete"
+    success "DragonForge is installed"
+    info "Reboot to apply VFIO module changes, then run:"
+    info "  ${BOLD}./dragonforge vm-create${NC}  — Create a Windows VM"
+    info "  ${BOLD}./dragonforge vm-start${NC}   — Start the VM"
+    echo ""
+}
+
+# ── VM Create ───────────────────────────────────────────────────────────────
+
+cmd_vm_create() {
+    print_banner
+    header "Creating VM"
+
+    local conf="$SCRIPT_DIR/config/dragonforge.conf"
+    if [ ! -f "$conf" ]; then
+        error "Config not found. Run './dragonforge detect' first."
+        exit 1
+    fi
+    source "$conf"
+
+    local vm_name="${VM_NAME:-win11-dragonforge}"
+    local vm_ram="${VM_RAM_MB:-16384}"
+    local vm_cpus="${VM_CPUS:-8}"
+    local disk_size="${VM_DISK_SIZE:-128G}"
+    local disk_path="${VM_DISK_PATH:-/var/lib/libvirt/images/${vm_name}.qcow2}"
+    local win_iso="${WIN_ISO_PATH:-}"
+    local virtio_iso="${VIRTIO_ISO_PATH:-}"
+
+    # Validate
+    if [ -z "$win_iso" ] || [ ! -f "$win_iso" ]; then
+        error "Windows ISO not found: $win_iso"
+        info "Set WIN_ISO_PATH in config/dragonforge.conf"
+        exit 1
+    fi
+
+    if [ -z "$virtio_iso" ] || [ ! -f "$virtio_iso" ]; then
+        warn "VirtIO ISO not found. Download from:"
+        info "https://fedorapeople.org/groups/virt/virtio-win/direct-downloads/stable-virtio/virtio-win.iso"
+    fi
+
+    # Create disk
+    if [ ! -f "$disk_path" ]; then
+        info "Creating ${disk_size} qcow2 disk..."
+        sudo qemu-img create -f qcow2 "$disk_path" "$disk_size"
+        success "Disk created: $disk_path"
+    else
+        warn "Disk already exists: $disk_path"
+    fi
+
+    # Copy OVMF VARS for secure boot
+    local ovmf_vars="/var/lib/libvirt/images/${vm_name}_VARS.fd"
+    if [ ! -f "$ovmf_vars" ]; then
+        local ovmf_src=""
+        for candidate in \
+            /usr/share/edk2/ovmf/OVMF_VARS.secboot.fd \
+            /usr/share/OVMF/OVMF_VARS.ms.fd \
+            /usr/share/OVMF/OVMF_VARS.fd \
+            /usr/share/edk2/ovmf/OVMF_VARS.fd; do
+            if [ -f "$candidate" ]; then
+                ovmf_src="$candidate"
+                break
+            fi
+        done
+        if [ -n "$ovmf_src" ]; then
+            sudo cp "$ovmf_src" "$ovmf_vars"
+            success "OVMF VARS: $ovmf_vars"
+        else
+            error "No OVMF VARS template found. Install edk2-ovmf."
+            exit 1
+        fi
+    fi
+
+    # Find OVMF CODE
+    local ovmf_code=""
+    for candidate in \
+        /usr/share/edk2/ovmf/OVMF_CODE.secboot.fd \
+        /usr/share/OVMF/OVMF_CODE.secboot.fd \
+        /usr/share/OVMF/OVMF_CODE.ms.fd \
+        /usr/share/edk2/ovmf/OVMF_CODE.fd \
+        /usr/share/OVMF/OVMF_CODE.fd; do
+        if [ -f "$candidate" ]; then
+            ovmf_code="$candidate"
+            break
+        fi
+    done
+
+    if [ -z "$ovmf_code" ]; then
+        error "No OVMF CODE found. Install edk2-ovmf."
+        exit 1
+    fi
+
+    # Generate VM XML
+    info "Generating VM definition..."
+
+    local xml_path="/tmp/${vm_name}.xml"
+    cat > "$xml_path" <<XMLEOF
+<domain type='kvm'>
+  <name>$vm_name</name>
+  <metadata>
+    <dragonforge:vm xmlns:dragonforge="https://github.com/Ghosts-Protocol-Pvt-Ltd/DragonForge">
+      <dragonforge:version>1.0.0</dragonforge:version>
+    </dragonforge:vm>
+  </metadata>
+  <memory unit='MiB'>$vm_ram</memory>
+  <currentMemory unit='MiB'>$vm_ram</currentMemory>
+  <vcpu placement='static'>$vm_cpus</vcpu>
+  <iothreads>1</iothreads>
+  <os firmware='efi'>
+    <type arch='x86_64' machine='q35'>hvm</type>
+    <firmware>
+      <feature enabled='yes' name='enrolled-keys'/>
+      <feature enabled='yes' name='secure-boot'/>
+    </firmware>
+    <loader readonly='yes' secure='yes' type='pflash'>$ovmf_code</loader>
+    <nvram template='$ovmf_code'>$ovmf_vars</nvram>
+    <boot dev='cdrom'/>
+    <boot dev='hd'/>
+  </os>
+  <features>
+    <acpi/>
+    <apic/>
+    <hyperv mode='custom'>
+      <relaxed state='on'/>
+      <vapic state='on'/>
+      <spinlocks state='on' retries='8191'/>
+      <vpindex state='on'/>
+      <runtime state='on'/>
+      <synic state='on'/>
+      <stimer state='on'/>
+      <frequencies state='on'/>
+      <vendor_id state='on' value='GenuineIntel'/>
+    </hyperv>
+    <kvm>
+      <hidden state='on'/>
+    </kvm>
+    <vmport state='off'/>
+    <smm state='on'/>
+  </features>
+  <cpu mode='host-passthrough' check='none' migratable='off'>
+    <topology sockets='1' dies='1' clusters='1' cores='$(( vm_cpus / 2 ))' threads='2'/>
+    <feature policy='require' name='topoext'/>
+  </cpu>
+  <clock offset='localtime'>
+    <timer name='rtc' tickpolicy='catchup'/>
+    <timer name='pit' tickpolicy='delay'/>
+    <timer name='hpet' present='no'/>
+    <timer name='hypervclock' present='yes'/>
+  </clock>
+  <on_poweroff>destroy</on_poweroff>
+  <on_reboot>restart</on_reboot>
+  <on_crash>destroy</on_crash>
+  <pm>
+    <suspend-to-mem enabled='no'/>
+    <suspend-to-disk enabled='no'/>
+  </pm>
+  <devices>
+    <emulator>/usr/bin/qemu-system-x86_64</emulator>
+
+    <!-- VirtIO Disk -->
+    <disk type='file' device='disk'>
+      <driver name='qemu' type='qcow2' cache='writeback' io='threads' discard='unmap' iothread='1' queues='4'/>
+      <source file='$disk_path'/>
+      <target dev='vda' bus='virtio'/>
+    </disk>
+
+    <!-- Windows ISO -->
+    <disk type='file' device='cdrom'>
+      <driver name='qemu' type='raw'/>
+      <source file='$win_iso'/>
+      <target dev='sda' bus='sata'/>
+      <readonly/>
+    </disk>
+
+    <!-- VirtIO Drivers ISO -->
+$(if [ -n "$virtio_iso" ] && [ -f "$virtio_iso" ]; then
+    echo "    <disk type='file' device='cdrom'>"
+    echo "      <driver name='qemu' type='raw'/>"
+    echo "      <source file='$virtio_iso'/>"
+    echo "      <target dev='sdb' bus='sata'/>"
+    echo "      <readonly/>"
+    echo "    </disk>"
+fi)
+
+    <!-- Network -->
+    <interface type='network'>
+      <source network='default'/>
+      <model type='virtio'/>
+    </interface>
+
+    <!-- SPICE Display (for initial setup) -->
+    <graphics type='spice' autoport='yes' listen='127.0.0.1'>
+      <listen type='address' address='127.0.0.1'/>
+    </graphics>
+    <video>
+      <model type='qxl' ram='65536' vram='65536' vgamem='16384' heads='1' primary='yes'/>
+    </video>
+
+    <!-- USB Controller -->
+    <controller type='usb' model='qemu-xhci' ports='8'/>
+    <input type='tablet' bus='usb'/>
+    <input type='keyboard' bus='usb'/>
+
+    <!-- TPM 2.0 (for Windows 11) -->
+    <tpm model='tpm-tis'>
+      <backend type='emulator' version='2.0'/>
+    </tpm>
+
+    <!-- GPU Passthrough -->
+    <hostdev mode='subsystem' type='pci' managed='yes'>
+      <source>
+        <address domain='0x0000' bus='0x$(echo $GPU_PCI | cut -d: -f1)' slot='0x$(echo $GPU_PCI | cut -d: -f2 | cut -d. -f1)' function='0x$(echo $GPU_PCI | cut -d. -f2)'/>
+      </source>
+      <address type='pci' domain='0x0000' bus='0x06' slot='0x00' function='0x0' multifunction='on'/>
+    </hostdev>
+    <hostdev mode='subsystem' type='pci' managed='yes'>
+      <source>
+        <address domain='0x0000' bus='0x$(echo $GPU_AUDIO | cut -d: -f1)' slot='0x$(echo $GPU_AUDIO | cut -d: -f2 | cut -d. -f1)' function='0x$(echo $GPU_AUDIO | cut -d. -f2)'/>
+      </source>
+      <address type='pci' domain='0x0000' bus='0x06' slot='0x00' function='0x1'/>
+    </hostdev>
+
+    <!-- Audio (through SPICE) -->
+    <sound model='ich9'>
+      <audio id='1'/>
+    </sound>
+    <audio id='1' type='spice'/>
+
+    <!-- Balloon -->
+    <memballoon model='virtio'/>
+
+    <!-- RNG -->
+    <rng model='virtio'>
+      <backend model='random'>/dev/urandom</backend>
+    </rng>
+  </devices>
+</domain>
+XMLEOF
+
+    success "VM XML generated: $xml_path"
+
+    # Define in libvirt
+    info "Defining VM in libvirt..."
+    if sudo virsh dominfo "$vm_name" &>/dev/null; then
+        warn "VM '$vm_name' already defined — undefining first"
+        sudo virsh undefine "$vm_name" --nvram 2>/dev/null || true
+    fi
+
+    sudo virsh define "$xml_path"
+    success "VM defined: $vm_name"
+
+    header "VM Created"
+    info "Start with:  ${BOLD}./dragonforge vm-start${NC}"
+    info "View with:   ${BOLD}./dragonforge vm-viewer${NC}"
+    echo ""
+}
+
+# ── VM Start ────────────────────────────────────────────────────────────────
+
+cmd_vm_start() {
+    local conf="$SCRIPT_DIR/config/dragonforge.conf"
+    [ -f "$conf" ] && source "$conf"
+    local vm_name="${VM_NAME:-win11-dragonforge}"
+
+    info "Starting $vm_name..."
+    sudo virsh start "$vm_name"
+    success "$vm_name is running"
+    info "Open viewer: ${BOLD}./dragonforge vm-viewer${NC}"
+}
+
+# ── VM Stop ─────────────────────────────────────────────────────────────────
+
+cmd_vm_stop() {
+    local conf="$SCRIPT_DIR/config/dragonforge.conf"
+    [ -f "$conf" ] && source "$conf"
+    local vm_name="${VM_NAME:-win11-dragonforge}"
+
+    info "Shutting down $vm_name..."
+    sudo virsh shutdown "$vm_name"
+    info "Waiting for graceful shutdown (30s timeout)..."
+
+    local i=0
+    while [ $i -lt 30 ]; do
+        if ! sudo virsh domstate "$vm_name" 2>/dev/null | grep -q "running"; then
+            success "$vm_name has shut down"
+            return 0
+        fi
+        sleep 1
+        i=$((i + 1))
+    done
+
+    warn "VM did not shut down gracefully. Use './dragonforge vm-kill' to force."
+}
+
+# ── VM Kill ─────────────────────────────────────────────────────────────────
+
+cmd_vm_kill() {
+    local conf="$SCRIPT_DIR/config/dragonforge.conf"
+    [ -f "$conf" ] && source "$conf"
+    local vm_name="${VM_NAME:-win11-dragonforge}"
+
+    warn "Force stopping $vm_name..."
+    sudo virsh destroy "$vm_name"
+    success "$vm_name forcefully stopped"
+}
+
+# ── VM Viewer ───────────────────────────────────────────────────────────────
+
+cmd_vm_viewer() {
+    local conf="$SCRIPT_DIR/config/dragonforge.conf"
+    [ -f "$conf" ] && source "$conf"
+    local vm_name="${VM_NAME:-win11-dragonforge}"
+
+    if ! command -v virt-viewer &>/dev/null; then
+        error "virt-viewer not installed"
+        info "Install: sudo dnf install virt-viewer"
+        exit 1
+    fi
+
+    info "Opening SPICE viewer for $vm_name..."
+    virt-viewer "$vm_name" &
+    disown
+    success "Viewer opened"
+}
+
+# ── Uninstall ───────────────────────────────────────────────────────────────
+
+cmd_uninstall() {
+    print_banner
+    header "Uninstalling DragonForge"
+
+    if [ "$EUID" -ne 0 ]; then
+        error "Uninstall must be run as root (use sudo)"
+        exit 1
+    fi
+
+    rm -f /etc/libvirt/hooks/qemu
+    rm -f /etc/libvirt/hooks/dragonforge.env
+    rm -f /etc/modules-load.d/dragonforge-vfio.conf
+    rm -f /etc/modprobe.d/dragonforge-vfio.conf
+
+    success "Hook removed"
+    success "VFIO configs removed"
+    info "Reboot to fully revert changes"
+    echo ""
+}
+
+# ── Main ────────────────────────────────────────────────────────────────────
+
+case "${1:-help}" in
+    detect)     cmd_detect ;;
+    setup)      cmd_setup ;;
+    status)     cmd_status ;;
+    vm-create)  cmd_vm_create ;;
+    vm-start)   cmd_vm_start ;;
+    vm-stop)    cmd_vm_stop ;;
+    vm-kill)    cmd_vm_kill ;;
+    vm-viewer)  cmd_vm_viewer ;;
+    uninstall)  cmd_uninstall ;;
+    help|*)
+        print_banner
+        echo "  Usage: ./dragonforge <command>"
+        echo ""
+        echo "  Commands:"
+        echo "    detect      Detect GPU, IOMMU groups, system info"
+        echo "    setup       Install hook + configure VFIO (requires sudo)"
+        echo "    status      Check passthrough state"
+        echo "    vm-create   Create Windows 11 VM from config"
+        echo "    vm-start    Start the VM"
+        echo "    vm-stop     Gracefully shut down the VM"
+        echo "    vm-kill     Force stop the VM"
+        echo "    vm-viewer   Open SPICE viewer"
+        echo "    uninstall   Remove hook and VFIO config (requires sudo)"
+        echo ""
+        ;;
+esac
