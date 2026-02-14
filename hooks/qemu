@@ -38,7 +38,7 @@ DEVICES="$GPU_PCI $GPU_AUDIO"
 
 # Timeout in seconds — if the hook takes longer than this, it self-terminates
 # to prevent libvirtd from hanging forever.
-HOOK_TIMEOUT="${DRAGONFORGE_HOOK_TIMEOUT:-30}"
+HOOK_TIMEOUT="${DRAGONFORGE_HOOK_TIMEOUT:-60}"
 
 # GPU temperature threshold (°C) — refuse passthrough if GPU is too hot
 GPU_TEMP_MAX="${DRAGONFORGE_GPU_TEMP_MAX:-85}"
@@ -97,7 +97,7 @@ trap _watchdog_cleanup EXIT
     kill -TERM $$ 2>/dev/null || true
     sleep 2
     kill -KILL $$ 2>/dev/null || true
-) &
+) </dev/null &>/dev/null &
 WATCHDOG_PID=$!
 
 # ── Helpers ─────────────────────────────────────────────────────────────────
@@ -185,8 +185,38 @@ if [ "$HOOK_NAME" = "prepare" ] && [ "$STATE_NAME" = "begin" ]; then
     # Hardware health check
     check_gpu_temperature
 
-    # Best-effort module unload (not required for device-level passthrough)
-    # Detect which GPU driver modules to try unloading
+    # ── Laptop dGPU: Release VT consoles & framebuffer ──────────────────────
+    # On hybrid laptops, DRM subsystem may hold references to the dGPU even
+    # when the compositor runs on the iGPU. Releasing VT console bindings and
+    # the EFI framebuffer allows nvidia_drm to be cleanly unloaded.
+    log "Releasing VT consoles and framebuffer"
+    for vtcon in /sys/class/vtconsole/vtcon*/bind; do
+        echo 0 > "$vtcon" 2>/dev/null || true
+    done
+    if [ -e /sys/bus/platform/drivers/efi-framebuffer/efi-framebuffer.0 ]; then
+        echo efi-framebuffer.0 > /sys/bus/platform/drivers/efi-framebuffer/unbind 2>/dev/null || true
+        log "Unbound EFI framebuffer"
+    fi
+
+    # ── Kill any processes holding nvidia device references ──────────────────
+    # On some setups, stale nvidia-persistenced or nvidia-smi can hold refs
+    if command -v nvidia-smi &>/dev/null; then
+        gpu_pids=$(nvidia-smi --query-compute-apps=pid --format=csv,noheader,nounits 2>/dev/null || true)
+        if [ -n "$gpu_pids" ]; then
+            log "Killing GPU processes: $gpu_pids"
+            for pid in $gpu_pids; do
+                kill -9 "$pid" 2>/dev/null || true
+            done
+            sleep 1
+        fi
+    fi
+    # Stop nvidia-persistenced if running
+    if systemctl is-active nvidia-persistenced &>/dev/null; then
+        systemctl stop nvidia-persistenced 2>/dev/null || true
+        log "Stopped nvidia-persistenced"
+    fi
+
+    # ── Unload GPU driver modules (strict order) ────────────────────────────
     gpu_modules=()
     case "$GPU_DRIVER" in
         nvidia)   gpu_modules=(nvidia_drm nvidia_modeset nvidia_uvm nvidia) ;;
@@ -196,17 +226,31 @@ if [ "$HOOK_NAME" = "prepare" ] && [ "$STATE_NAME" = "begin" ]; then
         *)        gpu_modules=(nvidia_drm nvidia_modeset nvidia_uvm nvidia nouveau amdgpu radeon) ;;
     esac
 
+    modules_unloaded=true
     for mod in "${gpu_modules[@]}"; do
         if lsmod | grep -q "^${mod}"; then
-            if modprobe -r "$mod" 2>/dev/null; then
-                log "Unloaded $mod"
-            else
-                log "$mod in use — skipping (device-level passthrough will handle it)"
+            # Retry up to 3 times with short waits
+            attempt=0
+            while [ "$attempt" -lt 3 ]; do
+                if modprobe -r "$mod" 2>/dev/null; then
+                    log "Unloaded $mod"
+                    break
+                fi
+                attempt=$((attempt + 1))
+                sleep 1
+            done
+            if lsmod | grep -q "^${mod}"; then
+                warn "$mod still loaded after 3 attempts (refcount: $(cat /sys/module/$mod/refcount 2>/dev/null || echo '?'))"
+                modules_unloaded=false
             fi
         fi
     done
 
-    # Unbind each device from its current driver
+    if [ "$modules_unloaded" = false ]; then
+        warn "Some modules could not be unloaded — attempting device-level unbind anyway"
+    fi
+
+    # ── Unbind each device from its current driver ──────────────────────────
     for dev in $DEVICES; do
         unbind_device "$dev" || true
     done
@@ -214,7 +258,7 @@ if [ "$HOOK_NAME" = "prepare" ] && [ "$STATE_NAME" = "begin" ]; then
     # Small settle delay for kernel to process unbinds
     sleep 0.5
 
-    # Bind each device to vfio-pci
+    # ── Bind each device to vfio-pci ────────────────────────────────────────
     for dev in $DEVICES; do
         bind_vfio "$dev" || true
     done
@@ -236,82 +280,123 @@ if [ "$HOOK_NAME" = "prepare" ] && [ "$STATE_NAME" = "begin" ]; then
 # ── Release: Return GPU to host ────────────────────────────────────────────
 
 elif [ "$HOOK_NAME" = "release" ] && [ "$STATE_NAME" = "end" ]; then
-    log "=== Returning GPU to host ==="
+    log "=== Returning GPU to host (forking to background) ==="
 
-    # Clean up stale QEMU domain directory (prevents SELinux label conflicts on next start)
-    for stale_dir in /var/lib/libvirt/qemu/domain-*-"${VM_NAME}"; do
-        if [ -d "$stale_dir" ]; then
-            log "Cleaning stale QEMU domain dir: $stale_dir"
-            rm -rf "$stale_dir" 2>/dev/null || true
-        fi
-    done
+    # CRITICAL: The release hook MUST return quickly or it blocks virtqemud.
+    # Fork the entire GPU restoration into the background so libvirt can
+    # continue processing. The background process handles everything.
+    (
+        # Give QEMU a moment to fully release the devices
+        sleep 1
 
-    # Unbind from vfio-pci
-    for dev in $DEVICES; do
-        unbind_device "$dev" || true
-    done
+        # Clean up stale QEMU domain directory (prevents SELinux label conflicts on next start)
+        for stale_dir in /var/lib/libvirt/qemu/domain-*-"${VM_NAME}"; do
+            if [ -d "$stale_dir" ]; then
+                log "Cleaning stale QEMU domain dir: $stale_dir"
+                rm -rf "$stale_dir" 2>/dev/null || true
+            fi
+        done
 
-    # Clear driver override so the original driver can reclaim
-    for dev in $DEVICES; do
-        echo "" > "/sys/bus/pci/devices/$dev/driver_override" 2>/dev/null || true
-    done
+        # Unbind from vfio-pci
+        for dev in $DEVICES; do
+            if [ -e "/sys/bus/pci/devices/$dev/driver" ]; then
+                current_driver=$(basename "$(readlink "/sys/bus/pci/devices/$dev/driver" 2>/dev/null)" 2>/dev/null)
+                log "Unbinding $dev from ${current_driver:-unknown}"
+                echo "$dev" > "/sys/bus/pci/devices/$dev/driver/unbind" 2>/dev/null || true
+                # Wait for unbind (max 3s)
+                for i in $(seq 1 6); do
+                    [ ! -e "/sys/bus/pci/devices/$dev/driver" ] && break
+                    sleep 0.5
+                done
+            fi
+        done
 
-    # Trigger PCI rescan
-    log "Rescanning PCI bus"
-    echo 1 > /sys/bus/pci/rescan 2>/dev/null || true
-    sleep 2
+        # Clear driver override so the original driver can reclaim
+        for dev in $DEVICES; do
+            echo "" > "/sys/bus/pci/devices/$dev/driver_override" 2>/dev/null || true
+        done
 
-    # Best-effort reload GPU driver stack
-    reload_modules=()
-    case "$GPU_DRIVER" in
-        nvidia)   reload_modules=(nvidia nvidia_modeset nvidia_uvm nvidia_drm) ;;
-        nouveau)  reload_modules=(nouveau) ;;
-        amdgpu)   reload_modules=(amdgpu) ;;
-        radeon)   reload_modules=(radeon) ;;
-        *)        reload_modules=(nvidia nvidia_modeset nvidia_uvm nvidia_drm) ;;
-    esac
+        # Trigger PCI rescan
+        log "Rescanning PCI bus"
+        echo 1 > /sys/bus/pci/rescan 2>/dev/null || true
+        sleep 2
 
-    for mod in "${reload_modules[@]}"; do
-        if modprobe "$mod" 2>/dev/null; then
-            log "Loaded $mod"
-        else
-            log "Could not load $mod (may not be needed)"
-        fi
-    done
+        # Best-effort reload GPU driver stack
+        reload_modules=()
+        case "$GPU_DRIVER" in
+            nvidia)   reload_modules=(nvidia nvidia_modeset nvidia_uvm nvidia_drm) ;;
+            nouveau)  reload_modules=(nouveau) ;;
+            amdgpu)   reload_modules=(amdgpu) ;;
+            radeon)   reload_modules=(radeon) ;;
+            *)        reload_modules=(nvidia nvidia_modeset nvidia_uvm nvidia_drm) ;;
+        esac
 
-    # Explicit rebind: if the device didn't auto-claim, manually bind to GPU driver
-    sleep 1
-    for dev in $DEVICES; do
-        driver=$(basename "$(readlink "/sys/bus/pci/devices/$dev/driver" 2>/dev/null)" 2>/dev/null)
-        if [ -z "$driver" ]; then
-            log "$dev has no driver — attempting explicit $GPU_DRIVER bind"
-            # Build list of drivers to try: configured driver first, then fallbacks
-            try_drivers=("$GPU_DRIVER")
-            case "$GPU_DRIVER" in
-                nvidia)   try_drivers+=(nouveau) ;;
-                nouveau)  try_drivers+=(nvidia) ;;
-                amdgpu)   try_drivers+=(radeon) ;;
-                radeon)   try_drivers+=(amdgpu) ;;
-            esac
-            for try_driver in "${try_drivers[@]}"; do
-                if [ -d "/sys/bus/pci/drivers/$try_driver" ]; then
-                    echo "$dev" > "/sys/bus/pci/drivers/$try_driver/bind" 2>/dev/null && {
-                        log "$dev explicitly bound to $try_driver"
-                        break
-                    } || true
-                fi
-            done
-            # Final check
-            sleep 0.5
+        for mod in "${reload_modules[@]}"; do
+            if modprobe "$mod" 2>/dev/null; then
+                log "Loaded $mod"
+            else
+                log "Could not load $mod (may not be needed)"
+            fi
+        done
+
+        # Explicit rebind: if the device didn't auto-claim, manually bind to GPU driver
+        sleep 1
+        for dev in $DEVICES; do
             driver=$(basename "$(readlink "/sys/bus/pci/devices/$dev/driver" 2>/dev/null)" 2>/dev/null)
+            if [ -z "$driver" ]; then
+                log "$dev has no driver — attempting explicit bind"
+
+                # Determine which driver to try based on device type
+                dev_class=$(cat "/sys/bus/pci/devices/$dev/class" 2>/dev/null)
+
+                # Audio device (0x040300) → snd_hda_intel; GPU (0x030000) → nvidia
+                if [ "${dev_class:0:6}" = "0x0403" ]; then
+                    try_drivers=(snd_hda_intel)
+                    log "$dev is audio device — trying snd_hda_intel"
+                else
+                    try_drivers=("$GPU_DRIVER")
+                    case "$GPU_DRIVER" in
+                        nvidia)   try_drivers+=(nouveau) ;;
+                        nouveau)  try_drivers+=(nvidia) ;;
+                        amdgpu)   try_drivers+=(radeon) ;;
+                        radeon)   try_drivers+=(amdgpu) ;;
+                    esac
+                fi
+
+                for try_driver in "${try_drivers[@]}"; do
+                    if [ -d "/sys/bus/pci/drivers/$try_driver" ]; then
+                        echo "$dev" > "/sys/bus/pci/drivers/$try_driver/bind" 2>/dev/null && {
+                            log "$dev explicitly bound to $try_driver"
+                            break
+                        } || true
+                    fi
+                done
+                # Final check
+                sleep 0.5
+                driver=$(basename "$(readlink "/sys/bus/pci/devices/$dev/driver" 2>/dev/null)" 2>/dev/null)
+            fi
+
+            if [ -n "$driver" ]; then
+                log "$dev returned to $driver"
+            else
+                warn "$dev has no driver after release — may need 'dragonforge reset'"
+            fi
+        done
+
+        # Restore VT consoles
+        log "Restoring VT consoles"
+        for vtcon in /sys/class/vtconsole/vtcon*/bind; do
+            echo 1 > "$vtcon" 2>/dev/null || true
+        done
+
+        # Restart nvidia-persistenced if it was running before
+        if systemctl is-enabled nvidia-persistenced &>/dev/null; then
+            systemctl start nvidia-persistenced 2>/dev/null || true
+            log "Restarted nvidia-persistenced"
         fi
 
-        if [ -n "$driver" ]; then
-            log "$dev returned to $driver"
-        else
-            warn "$dev has no driver after release — may need 'dragonforge reset'"
-        fi
-    done
-
-    log "=== GPU returned to host ==="
+        log "=== GPU returned to host ==="
+    ) </dev/null &>/dev/null &
+    disown
+    log "Release hook returned (GPU restoration running in background)"
 fi
